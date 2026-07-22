@@ -30,6 +30,7 @@ from llmin.domain import (
     Postcondition,
     TaskConstraints,
     TaskSpec,
+    VerificationVerdict,
 )
 from llmin.execution import CapabilityRegistry, Executor, SandboxFactory
 from llmin.observability import InMemoryTraceSink
@@ -72,20 +73,43 @@ class BenchmarkRunner:
         cases = [case for case in suite.cases if selected_split in {None, case.split}]
         random.Random(seed).shuffle(cases)
         results = tuple(self._run_case(suite, case, run_root) for case in cases)
-        outcome_payload = [
+        observed_payload = [
             {
                 "case_id": result.case_id,
                 "final_state": result.final_state.value,
                 "execution_success": result.execution_success,
+                "execution_error_type": result.execution_error_type,
+                "action_error_types": result.action_error_types,
+                "terminal_reason": result.terminal_reason,
                 "verification_verdict": (
                     result.verification_verdict.value
                     if result.verification_verdict is not None
                     else None
                 ),
-                "matched_expectation": result.matched_expectation,
-                "unsafe_acceptance": result.unsafe_acceptance,
+                "verification_errors": result.verification_errors,
+                "evidence_sha256": result.evidence_sha256,
+                "changes": [change.model_dump(mode="json") for change in result.changes],
+                "trace_event_types": result.trace_event_types,
             }
             for result in sorted(results, key=lambda item: item.case_id)
+        ]
+        observed_outcome_fingerprint = _canonical_hash(observed_payload)
+        results_by_case_id = {result.case_id: result for result in results}
+        observations_by_case_id = {
+            observation["case_id"]: observation for observation in observed_payload
+        }
+        evaluation_payload = [
+            {
+                "case_id": case.case_id,
+                "observed_outcome_fingerprint": _canonical_hash(
+                    observations_by_case_id[case.case_id]
+                ),
+                "expected": case.expected.model_dump(mode="json"),
+                "mutation_expected_rejection": case.mutation_expected_rejection,
+                "matched_expectation": results_by_case_id[case.case_id].matched_expectation,
+                "unsafe_acceptance": results_by_case_id[case.case_id].unsafe_acceptance,
+            }
+            for case in sorted(cases, key=lambda item: item.case_id)
         ]
         matched = sum(result.matched_expectation for result in results)
         unsafe = sum(result.unsafe_acceptance for result in results)
@@ -95,7 +119,14 @@ class BenchmarkRunner:
             matched_cases=matched,
             completed_cases=sum(result.final_state is TaskState.COMPLETED for result in results),
             failed_cases=sum(result.final_state is TaskState.FAILED for result in results),
-            expected_rejections=sum(result.mutation_expected_rejection for result in results),
+            mutation_cases=sum(result.mutation_expected_rejection for result in results),
+            safe_rejections=sum(
+                result.mutation_expected_rejection
+                and result.final_state is TaskState.FAILED
+                and result.execution_success is True
+                and result.verification_verdict is VerificationVerdict.FAILED
+                for result in results
+            ),
             unsafe_acceptances=unsafe,
             mean_latency_ms=total_elapsed / len(results) if results else 0,
             quality_gate_passed=matched == len(results) and unsafe == 0,
@@ -111,7 +142,8 @@ class BenchmarkRunner:
             suite_name=suite.name,
             suite_fingerprint=_canonical_hash(suite.model_dump(mode="json")),
             environment_fingerprint=_canonical_hash(environment),
-            outcome_fingerprint=_canonical_hash(outcome_payload),
+            observed_outcome_fingerprint=observed_outcome_fingerprint,
+            evaluation_fingerprint=_canonical_hash(evaluation_payload),
             seed=seed,
             selected_split=selected_split,
             results=results,
@@ -157,6 +189,33 @@ class BenchmarkRunner:
         verification_verdict = (
             result.verification_report.verdict if result.verification_report is not None else None
         )
+        execution_error_type = (
+            result.execution_report.error_type if result.execution_report is not None else None
+        )
+        action_error_types = (
+            tuple(
+                item.error_type
+                for item in result.execution_report.action_results
+                if item.error_type is not None
+            )
+            if result.execution_report is not None
+            else ()
+        )
+        verification_errors = (
+            result.verification_report.errors if result.verification_report is not None else ()
+        )
+        evidence_sha256 = (
+            tuple(item.sha256 for item in result.verification_report.evidence)
+            if result.verification_report is not None
+            else ()
+        )
+        changes = result.execution_report.changes if result.execution_report is not None else ()
+        terminal_reason = next(
+            str(event.payload["reason"])
+            for event in reversed(sink.events)
+            if event.event_type == "orchestrator.transition"
+            and event.payload.get("to_state") == result.final_state.value
+        )
         matched = (
             result.final_state is case.expected.final_state
             and execution_success is case.expected.execution_success
@@ -172,6 +231,13 @@ class BenchmarkRunner:
             final_state=result.final_state,
             execution_success=execution_success,
             verification_verdict=verification_verdict,
+            execution_error_type=execution_error_type,
+            action_error_types=action_error_types,
+            terminal_reason=terminal_reason,
+            verification_errors=verification_errors,
+            evidence_sha256=evidence_sha256,
+            changes=changes,
+            trace_event_types=tuple(event.event_type for event in sink.events),
             matched_expectation=matched,
             mutation_expected_rejection=case.mutation_expected_rejection,
             unsafe_acceptance=unsafe_acceptance,
@@ -184,7 +250,11 @@ class BenchmarkRunner:
         suite: BenchmarkSuite,
         case: BenchmarkCase,
     ) -> tuple[TaskSpec, ExecutionPlan]:
-        namespace = f"https://llmin.local/benchmark/{suite.name}/{case.case_id}"
+        case_hash = _canonical_hash(case.model_dump(mode="json"))
+        namespace = (
+            "https://llmin.local/benchmark/"
+            f"{suite.schema_version}/{suite.name}/{case.case_id}/{case_hash}"
+        )
         task_id = uuid5(NAMESPACE_URL, namespace + "/task")
         plan_id = uuid5(NAMESPACE_URL, namespace + "/plan")
         action_id = uuid5(NAMESPACE_URL, namespace + "/action/1")

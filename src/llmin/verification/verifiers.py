@@ -94,9 +94,9 @@ class TomlValueEqualsVerifier:
         ) as error:
             raise VerifierError(f"toml_value_equals could not inspect output: {error}") from error
         evidence = _file_evidence(kind="toml_file", path=parameters.path, content=content)
-        if document != parameters.value:
+        if type(document) is not type(parameters.value) or document != parameters.value:
             raise VerificationMismatch(
-                "TOML value does not equal expected value",
+                "TOML value type or value does not equal expected value",
                 evidence=evidence,
             )
         return evidence

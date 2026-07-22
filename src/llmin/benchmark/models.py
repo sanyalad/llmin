@@ -11,6 +11,7 @@ from uuid import UUID
 from pydantic import Field, field_validator, model_validator
 
 from llmin.domain import ContractModel, VerificationVerdict
+from llmin.execution import ChangeRecord
 from llmin.orchestrator import TaskState
 
 
@@ -57,8 +58,23 @@ class BenchmarkCase(ContractModel):
             value is not None for value in (self.key, self.action_value, self.expected_value)
         ):
             raise ValueError("incompatible cases cannot define TOML values")
-        if self.mutation_expected_rejection and self.expected.final_state is TaskState.COMPLETED:
-            raise ValueError("mutation rejection cases cannot expect completion")
+        if self.mutation_expected_rejection:
+            if self.mode is not CaseMode.PATCH_TOML:
+                raise ValueError("mutation rejection cases must execute patch_toml")
+            if self.expected != ExpectedOutcome(
+                final_state=TaskState.FAILED,
+                execution_success=True,
+                verification_verdict=VerificationVerdict.FAILED,
+            ):
+                raise ValueError(
+                    "mutation rejection cases must execute successfully and fail verification"
+                )
+            if type(self.action_value) is type(self.expected_value) and (
+                self.action_value == self.expected_value
+            ):
+                raise ValueError(
+                    "mutation rejection action and expected values must differ strictly"
+                )
         return self
 
 
@@ -96,6 +112,13 @@ class BenchmarkCaseResult(ContractModel):
     final_state: TaskState
     execution_success: bool | None
     verification_verdict: VerificationVerdict | None
+    execution_error_type: str | None
+    action_error_types: tuple[str, ...]
+    terminal_reason: str
+    verification_errors: tuple[str, ...]
+    evidence_sha256: tuple[str | None, ...]
+    changes: tuple[ChangeRecord, ...]
+    trace_event_types: tuple[str, ...]
     matched_expectation: bool
     mutation_expected_rejection: bool
     unsafe_acceptance: bool
@@ -108,7 +131,8 @@ class BenchmarkMetrics(ContractModel):
     matched_cases: int = Field(ge=0)
     completed_cases: int = Field(ge=0)
     failed_cases: int = Field(ge=0)
-    expected_rejections: int = Field(ge=0)
+    mutation_cases: int = Field(ge=0)
+    safe_rejections: int = Field(ge=0)
     unsafe_acceptances: int = Field(ge=0)
     llm_calls: int = Field(default=0, ge=0)
     variable_cost_usd: Decimal = Field(default=Decimal("0"), ge=0)
@@ -121,7 +145,8 @@ class BenchmarkReport(ContractModel):
     suite_name: str
     suite_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     environment_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
-    outcome_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    observed_outcome_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    evaluation_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     seed: int
     selected_split: BenchmarkSplit | None
     baseline_kind: Literal["deterministic_fixture"] = "deterministic_fixture"

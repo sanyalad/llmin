@@ -116,6 +116,50 @@
       "expected": {"final_state": "failed", "execution_success": true, "verification_verdict": "failed"}
     },
     {
+      "case_id": "holdout_mutation_true_vs_one",
+      "split": "holdout",
+      "mode": "patch_toml",
+      "initial_toml": "[feature]\nenabled = false\n",
+      "key": "feature.enabled",
+      "action_value": 1,
+      "expected_value": true,
+      "mutation_expected_rejection": true,
+      "expected": {"final_state": "failed", "execution_success": true, "verification_verdict": "failed"}
+    },
+    {
+      "case_id": "holdout_mutation_false_vs_zero",
+      "split": "holdout",
+      "mode": "patch_toml",
+      "initial_toml": "[feature]\nenabled = true\n",
+      "key": "feature.enabled",
+      "action_value": 0,
+      "expected_value": false,
+      "mutation_expected_rejection": true,
+      "expected": {"final_state": "failed", "execution_success": true, "verification_verdict": "failed"}
+    },
+    {
+      "case_id": "holdout_mutation_integer_vs_float",
+      "split": "holdout",
+      "mode": "patch_toml",
+      "initial_toml": "[limits]\nvalue = 0\n",
+      "key": "limits.value",
+      "action_value": 1,
+      "expected_value": 1.0,
+      "mutation_expected_rejection": true,
+      "expected": {"final_state": "failed", "execution_success": true, "verification_verdict": "failed"}
+    },
+    {
+      "case_id": "holdout_mutation_string_vs_integer",
+      "split": "holdout",
+      "mode": "patch_toml",
+      "initial_toml": "[limits]\nvalue = 0\n",
+      "key": "limits.value",
+      "action_value": "1",
+      "expected_value": 1,
+      "mutation_expected_rejection": true,
+      "expected": {"final_state": "failed", "execution_success": true, "verification_verdict": "failed"}
+    },
+    {
       "case_id": "holdout_missing_key",
       "split": "holdout",
       "mode": "capability_error",

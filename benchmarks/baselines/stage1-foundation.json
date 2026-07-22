@@ -1,10 +1,13 @@
 {
   "schema_version": "1.0",
   "suite_name": "stage1_foundation",
-  "suite_fingerprint": "e939872cdcc027a43b885276b593e5197f167ac6e6f4a27dea31697bbcf78ea9",
-  "outcome_fingerprint": "2d4e05c524265627eeb4480220858a7cf99aec3a1ca37b1b9a4e0fb7417c0158",
-  "total_cases": 13,
-  "matched_cases": 13,
+  "suite_fingerprint": "2d6c285e7f3f15535e9fad2870309724e76f3037fdda36e0185388dc0739e2c1",
+  "observed_outcome_fingerprint": "4ee4956b9a61d43e39d97463a7b5139a90d275a2611862fecf9de47f1c74387d",
+  "evaluation_fingerprint": "9997ca65626948c76d1a2ebb2e66647fb5ff348df4a6c4c8f9b8f6cc511f9325",
+  "total_cases": 17,
+  "matched_cases": 17,
+  "mutation_cases": 6,
+  "safe_rejections": 6,
   "unsafe_acceptances": 0,
   "quality_gate_passed": true
 }

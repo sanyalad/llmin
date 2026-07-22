@@ -154,7 +154,8 @@ def run_benchmark(
             {
                 "suite": report.suite_name,
                 "suite_fingerprint": report.suite_fingerprint,
-                "outcome_fingerprint": report.outcome_fingerprint,
+                "observed_outcome_fingerprint": report.observed_outcome_fingerprint,
+                "evaluation_fingerprint": report.evaluation_fingerprint,
                 "cases": report.metrics.total_cases,
                 "matched": report.metrics.matched_cases,
                 "unsafe_acceptances": report.metrics.unsafe_acceptances,
