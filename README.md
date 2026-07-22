@@ -13,6 +13,7 @@ LLMIN — экспериментальная автономная агентна
 - [ADR-0001: первый вертикальный срез](docs/adr/0001-terminal-vertical-slice.md)
 - [Правила ведения GitHub](docs/github-workflow.md)
 - [Локальная разработка](docs/development.md)
+- [Sandbox execution](docs/sandbox.md)
 - [Как участвовать в разработке](CONTRIBUTING.md)
 
 ## Коротко об архитектуре

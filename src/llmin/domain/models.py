@@ -12,7 +12,7 @@ from uuid import UUID, uuid4
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
-def _safe_relative_path(value: str) -> str:
+def normalize_relative_path(value: str) -> str:
     """Normalize a portable relative path and reject sandbox escapes."""
 
     if not value or "\\" in value:
@@ -84,7 +84,7 @@ class TaskConstraints(ContractModel):
     def validate_writable_paths(cls, value: Any) -> tuple[str, ...]:
         if value is None:
             return ()
-        return tuple(_safe_relative_path(item) for item in value)
+        return tuple(normalize_relative_path(item) for item in value)
 
     @field_validator("allowed_capabilities")
     @classmethod
@@ -116,7 +116,7 @@ class TaskSpec(ContractModel):
     @field_validator("workspace")
     @classmethod
     def validate_workspace(cls, value: str) -> str:
-        return _safe_relative_path(value)
+        return normalize_relative_path(value)
 
     @field_validator("created_at")
     @classmethod
