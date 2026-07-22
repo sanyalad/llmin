@@ -12,16 +12,19 @@ from uuid import UUID
 
 from llmin.domain import Evidence
 from llmin.memory.models import (
+    ArtifactRelation,
     AttemptMemory,
+    ContradictionRecord,
+    ContradictionStatus,
     CostEntry,
     Episode,
     EpisodeTransition,
     MemoryState,
-    episode_content_hash,
+    artifact_content_hash,
 )
 from llmin.observability import TraceEvent, redact
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _ALLOWED_TRANSITIONS = {
     MemoryState.ACTIVE: frozenset(
         {MemoryState.COLD, MemoryState.QUARANTINED, MemoryState.TOMBSTONED}
@@ -126,7 +129,7 @@ class SQLiteMemoryStore:
         if episode.state is not MemoryState.ACTIVE:
             raise MemoryStoreError("new episodes must start active")
         sanitized = Episode.model_validate(redact(episode.model_dump()))
-        if sanitized.summary is None or sanitized.content_hash != episode_content_hash(
+        if sanitized.summary is None or sanitized.content_hash != artifact_content_hash(
             sanitized.summary
         ):
             raise MemoryStoreError("episode content hash does not match sanitized payload")
@@ -144,6 +147,61 @@ class SQLiteMemoryStore:
                 "INSERT INTO episodes(episode_id, state, document) VALUES (?, ?, ?)",
                 (str(sanitized.episode_id), sanitized.state.value, document),
             )
+
+    def append_relation(self, relation: ArtifactRelation) -> None:
+        sanitized = ArtifactRelation.model_validate(redact(relation.model_dump()))
+        with self._connect() as connection:
+            self._require_artifacts_exist(
+                connection,
+                {sanitized.source_artifact_id, sanitized.target_artifact_id},
+            )
+            self._insert_artifact_record(
+                connection,
+                table="artifact_relations",
+                identifier_column="relation_id",
+                identifier=sanitized.relation_id,
+                document=sanitized.model_dump_json(),
+                kind="artifact relation",
+            )
+
+    def append_contradiction(self, contradiction: ContradictionRecord) -> None:
+        sanitized = ContradictionRecord.model_validate(redact(contradiction.model_dump()))
+        with self._connect() as connection:
+            self._require_artifacts_exist(connection, sanitized.artifact_ids)
+            if sanitized.supersedes_contradiction_id is not None:
+                prior = connection.execute(
+                    "SELECT document FROM contradictions WHERE contradiction_id = ?",
+                    (str(sanitized.supersedes_contradiction_id),),
+                ).fetchone()
+                if prior is None:
+                    raise MemoryStoreError("contradiction resolution references an unknown record")
+                previous = ContradictionRecord.model_validate_json(prior[0])
+                if previous.status is not ContradictionStatus.OPEN:
+                    raise MemoryStoreError("only an open contradiction can be superseded")
+                if previous.artifact_ids != sanitized.artifact_ids:
+                    raise MemoryStoreError("contradiction resolution must preserve artifact scope")
+            self._insert_artifact_record(
+                connection,
+                table="contradictions",
+                identifier_column="contradiction_id",
+                identifier=sanitized.contradiction_id,
+                document=sanitized.model_dump_json(),
+                kind="contradiction",
+            )
+
+    def relations(self) -> tuple[ArtifactRelation, ...]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT document FROM artifact_relations ORDER BY rowid"
+            ).fetchall()
+        return tuple(ArtifactRelation.model_validate_json(row[0]) for row in rows)
+
+    def contradictions(self) -> tuple[ContradictionRecord, ...]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT document FROM contradictions ORDER BY rowid"
+            ).fetchall()
+        return tuple(ContradictionRecord.model_validate_json(row[0]) for row in rows)
 
     def get_episode(self, episode_id: UUID) -> Episode | None:
         with self._connect() as connection:
@@ -221,7 +279,7 @@ class SQLiteMemoryStore:
         connection: sqlite3.Connection,
         episode: Episode,
     ) -> None:
-        for event_id in episode.source_event_ids:
+        for event_id in episode.provenance.source_event_ids:
             row = connection.execute(
                 "SELECT attempt_id, document FROM trace_events WHERE event_id = ?",
                 (str(event_id),),
@@ -233,7 +291,7 @@ class SQLiteMemoryStore:
                 raise MemoryStoreError(
                     "episode trace provenance belongs to another task or attempt"
                 )
-        for evidence_id in episode.evidence_ids:
+        for evidence_id in episode.provenance.evidence_ids:
             row = connection.execute(
                 "SELECT attempt_id FROM evidence WHERE evidence_id = ?",
                 (str(evidence_id),),
@@ -242,6 +300,43 @@ class SQLiteMemoryStore:
                 raise MemoryStoreError("episode references unknown evidence")
             if row[0] != str(episode.attempt_id):
                 raise MemoryStoreError("episode evidence belongs to another attempt")
+
+    @staticmethod
+    def _require_artifacts_exist(
+        connection: sqlite3.Connection,
+        artifact_ids: frozenset[UUID] | set[UUID],
+    ) -> None:
+        for artifact_id in artifact_ids:
+            row = connection.execute(
+                "SELECT 1 FROM episodes WHERE episode_id = ?",
+                (str(artifact_id),),
+            ).fetchone()
+            if row is None:
+                raise MemoryStoreError("artifact relation references an unknown artifact")
+
+    def _insert_artifact_record(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        table: str,
+        identifier_column: str,
+        identifier: UUID,
+        document: str,
+        kind: str,
+    ) -> None:
+        if table not in {"artifact_relations", "contradictions"}:
+            raise MemoryStoreError("unsupported artifact record table")
+        existing = connection.execute(
+            f"SELECT document FROM {table} WHERE {identifier_column} = ?",
+            (str(identifier),),
+        ).fetchone()
+        if existing is not None:
+            self._require_identical(existing[0], document, kind)
+            return
+        connection.execute(
+            f"INSERT INTO {table}({identifier_column}, document) VALUES (?, ?)",
+            (str(identifier), document),
+        )
 
     def _insert_immutable(
         self,
@@ -321,6 +416,14 @@ class SQLiteMemoryStore:
                 CREATE TABLE IF NOT EXISTS episode_transitions (
                     transition_id TEXT PRIMARY KEY,
                     episode_id TEXT NOT NULL REFERENCES episodes(episode_id),
+                    document TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS artifact_relations (
+                    relation_id TEXT PRIMARY KEY,
+                    document TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS contradictions (
+                    contradiction_id TEXT PRIMARY KEY,
                     document TEXT NOT NULL
                 );
                 """

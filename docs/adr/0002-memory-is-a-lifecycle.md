@@ -2,7 +2,7 @@
 
 - Status: accepted
 - Date: 2026-07-22
-- Manifesto: 0.3-draft
+- Manifesto: 0.4-draft
 
 ## Context
 
@@ -25,12 +25,22 @@ Memory v0 separates two concerns:
 
 1. An append-only evidence journal stores redacted trace events, verifier evidence, and cost
    entries required to reconstruct an attempt.
-2. Governed memory objects represent selected episodes and later semantic/procedural artifacts.
-   They carry provenance, an explicit retention policy, environment compatibility, and a
-   lifecycle state.
+2. Governed `MemoryArtifact` objects represent selected episodes, rules, experiments, and
+   later procedural skills. They carry provenance, applicability, an explicit retention
+   policy, environment compatibility, and a lifecycle state.
 
-The first implementation supports episodic objects only. Semantic and procedural values are
-reserved contract layers until crystallization owns their promotion rules.
+The first implementation persists episodic objects only. It defines contracts for rules,
+experiments, relations, and contradictions so later crystallization cannot invent incompatible
+identities or provenance, but it does not route or promote them.
+
+An artifact is a versioned claim, not truth. New artifacts never overwrite conflicting ones.
+Relationships such as `derived_from`, `supports`, `contradicts`, `refines`, and `supersedes`
+are explicit records. A contradiction remains open until evidence explains it; replacement is
+not an implicit conflict-resolution policy.
+
+Applicability is mandatory for reusable artifacts. It describes task family, structured scope,
+environment fingerprints, preconditions, exclusions, and required capabilities. A router must
+be able to return `no reliable memory found`.
 
 Allowed episode states are `active`, `cold`, `quarantined`, and `tombstoned`. A tombstone is
 retained after payload removal so forgetting remains auditable. State changes are append-only
@@ -55,4 +65,5 @@ SQLite is an adapter behind contracts, not the definition of memory semantics.
 - Compaction and deletion need policy tests and provenance checks, not only CRUD tests.
 - Physical holdout isolation remains a separate benchmark/crystallization boundary.
 - Memory v0 intentionally does not implement similarity search, autonomous summarization,
-  semantic promotion, or destructive vacuuming.
+  semantic promotion, automatic contradiction resolution, shadow/canary activation, Memory
+  Economist decisions, or destructive vacuuming.

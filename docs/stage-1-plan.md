@@ -441,6 +441,8 @@ llmin/
 
 - Реализовать append-only SQLite journal для redacted traces, evidence и costs.
 - Разделить evidence journal и управляемые memory objects.
+- Зафиксировать общий MemoryArtifact, Provenance, Applicability и ArtifactRelation.
+- Сохранять contradictions и отвергнутые ExperimentArtifact без автоматического разрешения.
 - Определить episodic lifecycle: active, cold, quarantined, tombstoned.
 - Зафиксировать provenance и environment compatibility.
 - Реализовать reconstruction попытки без загрузки истории в LLM context.
