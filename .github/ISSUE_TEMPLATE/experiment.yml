@@ -1,0 +1,46 @@
+name: Experiment
+description: Проверить гипотезу измеримым и воспроизводимым экспериментом
+title: "[Experiment]: "
+labels: ["type:experiment"]
+body:
+  - type: textarea
+    id: hypothesis
+    attributes:
+      label: Гипотеза
+      description: Формулировка, которую можно опровергнуть.
+    validations:
+      required: true
+  - type: textarea
+    id: baseline
+    attributes:
+      label: Baseline
+      description: С чем сравниваем результат.
+    validations:
+      required: true
+  - type: textarea
+    id: method
+    attributes:
+      label: Метод
+      description: Данные, среда, seeds и порядок запуска.
+    validations:
+      required: true
+  - type: textarea
+    id: success
+    attributes:
+      label: Условие успеха
+      description: Метрики и пороги, заданные до запуска.
+    validations:
+      required: true
+  - type: textarea
+    id: risks
+    attributes:
+      label: Риски и искажения
+    validations:
+      required: true
+  - type: textarea
+    id: artifacts
+    attributes:
+      label: Ожидаемые артефакты
+      description: Отчёт, raw data, ADR или код.
+    validations:
+      required: true

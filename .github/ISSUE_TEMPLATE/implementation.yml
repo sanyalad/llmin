@@ -1,0 +1,45 @@
+name: Implementation
+description: Реализовать ограниченное и проверяемое изменение
+title: "[Implementation]: "
+labels: ["type:implementation"]
+body:
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Ожидаемый результат
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: Что входит и что явно не входит.
+    validations:
+      required: true
+  - type: textarea
+    id: contracts
+    attributes:
+      label: Контракты и зависимости
+    validations:
+      required: true
+  - type: textarea
+    id: validation
+    attributes:
+      label: План проверки
+    validations:
+      required: true
+  - type: textarea
+    id: fallback
+    attributes:
+      label: Ошибки, риск и fallback
+    validations:
+      required: true
+  - type: checkboxes
+    id: done
+    attributes:
+      label: Definition of Done
+      options:
+        - label: Контракты определены
+        - label: Тесты добавлены
+        - label: Наблюдаемость добавлена
+        - label: Документация обновлена
