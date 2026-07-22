@@ -13,6 +13,8 @@ LLMIN — экспериментальная автономная агентна
 - [ADR-0001: первый вертикальный срез](docs/adr/0001-terminal-vertical-slice.md)
 - [Правила ведения GitHub](docs/github-workflow.md)
 - [Локальная разработка](docs/development.md)
+- [Sandbox execution](docs/sandbox.md)
+- [Независимая верификация](docs/verification.md)
 - [Как участвовать в разработке](CONTRIBUTING.md)
 
 ## Коротко об архитектуре
@@ -49,8 +51,16 @@ LLM planner ───────────────→ Crystallizer
 
 ## Первый исполняемый инкремент
 
-В ветке разработки реализуются строгие доменные контракты, конечный автомат оркестратора и редактируемая до сохранения JSONL-трассировка. Задачу-fixture можно проверить без исполнения:
+Реализован минимальный проверяемый pipeline: строгие контракты → fake planner → policy → sandbox executor → независимый verifier → терминальное состояние. Валидация не создаёт побочных эффектов:
 
 ```powershell
 llmin validate-task benchmarks\tasks\config_patch\001.json
 ```
+
+Воспроизводимый fixture можно прогнать в отдельной копии template workspace:
+
+```powershell
+llmin run-fixture <task.json> <plan.json> <base-root>
+```
+
+Состояние `COMPLETED` возможно только после verifier verdict `PASSED`.

@@ -131,8 +131,9 @@ workspace: sandbox/task-123
 inputs:
   files: [config.toml]
 constraints:
+  readable_paths: [config.toml]
   writable_paths: [config.toml]
-  allowed_capabilities: [read_file, patch_toml]
+  allowed_capabilities: [read_text, patch_toml]
 postconditions:
   - type: toml_value_equals
     path: config.toml
@@ -142,7 +143,7 @@ risk_class: low
 budget:
   max_llm_calls: 2
   max_cost_usd: 0.10
-  timeout_seconds: 30
+  max_actions: 20
 ```
 
 ### 6.2 Orchestrator

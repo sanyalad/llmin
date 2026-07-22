@@ -1,3 +1,5 @@
+import json
+import shutil
 from pathlib import Path
 
 from typer.testing import CliRunner
@@ -25,3 +27,23 @@ def test_validate_task_rejects_unknown_fields(tmp_path) -> None:
 
     assert result.exit_code == 2
     assert "invalid:" in result.stderr
+
+
+def test_run_fixture_reaches_verified_terminal_state(tmp_path: Path) -> None:
+    task_file = Path("benchmarks/tasks/config_patch/001.json")
+    plan_file = Path("benchmarks/plans/config_patch/001.json")
+    workspace = tmp_path / "sandbox" / "config-patch-001"
+    workspace.parent.mkdir()
+    shutil.copytree(Path("benchmarks/workspaces/config-patch-001"), workspace)
+
+    result = runner.invoke(
+        app,
+        ["run-fixture", str(task_file), str(plan_file), str(tmp_path)],
+    )
+
+    assert result.exit_code == 0
+    summary = json.loads(result.stdout)
+    assert summary["final_state"] == "completed"
+    assert summary["execution_success"] is True
+    assert summary["verification_verdict"] == "passed"
+    assert summary["trace_events"] > 0

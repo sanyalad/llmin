@@ -1,6 +1,8 @@
 import json
 from uuid import uuid4
 
+import pytest
+
 from llmin.observability import InMemoryTraceSink, JsonlTraceSink, TraceEvent, redact
 
 
@@ -50,3 +52,24 @@ def test_jsonl_sink_writes_one_valid_redacted_event_per_line(tmp_path) -> None:
     assert len(documents) == 2
     assert documents[0]["payload"]["secret"] == "[REDACTED]"
     assert documents[1]["payload"]["count"] == 2
+
+
+def test_redaction_catches_sensitive_headers_and_string_values() -> None:
+    result = redact(
+        {
+            "X-API-Key": "plain-value",
+            "message": "Authorization: Bearer abc.def.ghi",
+            "nested": "token=super-secret-value",
+        }
+    )
+
+    assert result["X-API-Key"] == "[REDACTED]"
+    assert "abc.def.ghi" not in result["message"]
+    assert "super-secret-value" not in result["nested"]
+
+
+def test_trace_payload_is_recursively_immutable() -> None:
+    event = make_event({"nested": {"value": 1}})
+
+    with pytest.raises(TypeError, match="cannot be mutated"):
+        event.payload["nested"]["value"] = 2
