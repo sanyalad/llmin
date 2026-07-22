@@ -160,7 +160,11 @@ class BenchmarkRunner:
         workspace = run_root / task.workspace
         workspace.mkdir(parents=True, exist_ok=False)
         if case.initial_toml:
-            (workspace / "config.toml").write_text(case.initial_toml, encoding="utf-8")
+            (workspace / "config.toml").write_text(
+                case.initial_toml,
+                encoding="utf-8",
+                newline="\n",
+            )
 
         sink = InMemoryTraceSink()
         sandbox_factory = SandboxFactory(run_root)
