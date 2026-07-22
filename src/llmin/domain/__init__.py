@@ -4,6 +4,7 @@ from llmin.domain.json_types import FrozenDict, freeze_json, freeze_json_object
 from llmin.domain.models import (
     Action,
     Budget,
+    ContractModel,
     Evidence,
     ExecutionPlan,
     KnowledgeArtifact,
@@ -21,6 +22,7 @@ from llmin.domain.models import (
 __all__ = [
     "Action",
     "Budget",
+    "ContractModel",
     "Evidence",
     "ExecutionPlan",
     "FrozenDict",

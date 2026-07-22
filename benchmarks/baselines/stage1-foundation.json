@@ -1,0 +1,10 @@
+{
+  "schema_version": "1.0",
+  "suite_name": "stage1_foundation",
+  "suite_fingerprint": "e939872cdcc027a43b885276b593e5197f167ac6e6f4a27dea31697bbcf78ea9",
+  "outcome_fingerprint": "2d4e05c524265627eeb4480220858a7cf99aec3a1ca37b1b9a4e0fb7417c0158",
+  "total_cases": 13,
+  "matched_cases": 13,
+  "unsafe_acceptances": 0,
+  "quality_gate_passed": true
+}

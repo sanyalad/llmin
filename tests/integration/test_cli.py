@@ -47,3 +47,26 @@ def test_run_fixture_reaches_verified_terminal_state(tmp_path: Path) -> None:
     assert summary["execution_success"] is True
     assert summary["verification_verdict"] == "passed"
     assert summary["trace_events"] > 0
+
+
+def test_benchmark_command_writes_passing_report(tmp_path: Path) -> None:
+    output = tmp_path / "report.json"
+
+    result = runner.invoke(
+        app,
+        [
+            "benchmark",
+            "benchmarks/stage1-suite.json",
+            "--seed",
+            "11",
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 0
+    summary = json.loads(result.stdout)
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert summary["quality_gate_passed"] is True
+    assert summary["unsafe_acceptances"] == 0
+    assert report["metrics"]["total_cases"] == 13
