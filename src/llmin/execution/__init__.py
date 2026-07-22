@@ -2,7 +2,12 @@
 
 from llmin.execution.executor import CapabilityRegistry, Executor
 from llmin.execution.models import ActionResult, ChangeRecord, ExecutionReport
-from llmin.execution.sandbox import Sandbox, SandboxPolicyError, SandboxTransaction
+from llmin.execution.sandbox import (
+    Sandbox,
+    SandboxFactory,
+    SandboxPolicyError,
+    SandboxTransaction,
+)
 
 __all__ = [
     "ActionResult",
@@ -11,6 +16,7 @@ __all__ = [
     "ExecutionReport",
     "Executor",
     "Sandbox",
+    "SandboxFactory",
     "SandboxPolicyError",
     "SandboxTransaction",
 ]

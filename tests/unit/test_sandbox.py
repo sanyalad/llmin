@@ -1,3 +1,5 @@
+import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -80,6 +82,41 @@ def test_transaction_commit_returns_hash_manifest(tmp_path: Path) -> None:
     assert changes[0].path == "target.txt"
     assert changes[0].kind == "modified"
     assert changes[0].before_sha256 != changes[0].after_sha256
+
+
+def test_rollback_closes_transaction_and_aggregates_restore_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "target.txt"
+    target.write_text("before", encoding="utf-8")
+    sandbox = Sandbox(tmp_path, writable_paths=("target.txt",))
+    transaction = sandbox.transaction()
+    transaction.write_text_atomic("target.txt", "after")
+
+    def fail_restore(*_args: object, **_kwargs: object) -> None:
+        raise SandboxPolicyError("simulated restore failure")
+
+    monkeypatch.setattr(transaction, "_atomic_replace", fail_restore)
+
+    with pytest.raises(SandboxPolicyError, match=r"rollback failed.*simulated restore failure"):
+        transaction.rollback()
+    with pytest.raises(SandboxPolicyError, match="already closed"):
+        transaction.write_text_atomic("target.txt", "again")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission semantics")
+def test_atomic_write_preserves_existing_file_permissions(tmp_path: Path) -> None:
+    target = tmp_path / "target.txt"
+    target.write_text("before", encoding="utf-8")
+    target.chmod(0o640)
+    sandbox = Sandbox(tmp_path, writable_paths=("target.txt",))
+
+    with sandbox.transaction() as transaction:
+        transaction.write_text_atomic("target.txt", "after")
+        transaction.commit()
+
+    assert stat.S_IMODE(target.stat().st_mode) == 0o640
 
 
 def test_writes_reject_symlink_components_when_supported(tmp_path: Path) -> None:

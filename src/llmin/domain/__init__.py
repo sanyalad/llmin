@@ -1,5 +1,6 @@
 """Stable domain contracts shared across LLMIN components."""
 
+from llmin.domain.json_types import FrozenDict, freeze_json, freeze_json_object
 from llmin.domain.models import (
     Action,
     Budget,
@@ -14,6 +15,7 @@ from llmin.domain.models import (
     TaskSpec,
     VerificationReport,
     VerificationVerdict,
+    normalize_relative_path,
 )
 
 __all__ = [
@@ -21,6 +23,7 @@ __all__ = [
     "Budget",
     "Evidence",
     "ExecutionPlan",
+    "FrozenDict",
     "KnowledgeArtifact",
     "KnowledgeStatus",
     "PlannerKind",
@@ -30,4 +33,7 @@ __all__ = [
     "TaskSpec",
     "VerificationReport",
     "VerificationVerdict",
+    "freeze_json",
+    "freeze_json_object",
+    "normalize_relative_path",
 ]

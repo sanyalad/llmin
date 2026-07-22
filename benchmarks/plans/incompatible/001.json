@@ -1,0 +1,14 @@
+{
+  "schema_version": "1.0",
+  "plan_id": "853d43d8-82b4-41cc-9db1-d314ec08d469",
+  "task_id": "81c83147-f274-4814-8610-7bc68a3aeb85",
+  "planner_kind": "fake",
+  "actions": [
+    {
+      "action_id": "95197f42-0fda-4e85-a5d5-de743eb28ee2",
+      "capability": "unknown_capability",
+      "arguments": {}
+    }
+  ],
+  "estimated_cost_usd": "0"
+}

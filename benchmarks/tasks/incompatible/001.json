@@ -1,0 +1,32 @@
+{
+  "schema_version": "1.0",
+  "task_id": "81c83147-f274-4814-8610-7bc68a3aeb85",
+  "family": "incompatible",
+  "objective": "Корректно отказаться от неизвестной capability",
+  "workspace": "sandbox/incompatible-001",
+  "inputs": {},
+  "constraints": {
+    "readable_paths": [],
+    "writable_paths": [],
+    "allowed_capabilities": [
+      "unknown_capability"
+    ],
+    "network_allowed": false
+  },
+  "postconditions": [
+    {
+      "type": "text_equals",
+      "parameters": {
+        "path": "output.txt",
+        "value": "never created"
+      }
+    }
+  ],
+  "risk_class": "low",
+  "budget": {
+    "max_llm_calls": 0,
+    "max_cost_usd": "0",
+    "max_actions": 1
+  },
+  "created_at": "2026-07-22T00:00:00Z"
+}

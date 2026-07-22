@@ -6,10 +6,12 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
 from pathlib import PurePosixPath
-from typing import Any, Self
+from typing import Any, Literal, Self
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from llmin.domain.json_types import FrozenDict, freeze_json_object
 
 
 def normalize_relative_path(value: str) -> str:
@@ -70,16 +72,16 @@ class KnowledgeStatus(StrEnum):
 class Budget(ContractModel):
     max_llm_calls: int = Field(default=2, ge=0)
     max_cost_usd: Decimal = Field(default=Decimal("0.10"), ge=0)
-    timeout_seconds: int = Field(default=30, gt=0, le=3600)
     max_actions: int = Field(default=20, gt=0, le=10_000)
 
 
 class TaskConstraints(ContractModel):
+    readable_paths: tuple[str, ...] = ()
     writable_paths: tuple[str, ...] = ()
     allowed_capabilities: frozenset[str] = frozenset()
     network_allowed: bool = False
 
-    @field_validator("writable_paths", mode="before")
+    @field_validator("readable_paths", "writable_paths", mode="before")
     @classmethod
     def validate_writable_paths(cls, value: Any) -> tuple[str, ...]:
         if value is None:
@@ -99,9 +101,14 @@ class Postcondition(ContractModel):
     parameters: dict[str, Any] = Field(default_factory=dict)
     required: bool = True
 
+    @field_validator("parameters", mode="after")
+    @classmethod
+    def freeze_parameters(cls, value: Any) -> FrozenDict:
+        return freeze_json_object(value)
+
 
 class TaskSpec(ContractModel):
-    schema_version: str = "1.0"
+    schema_version: Literal["1.0"] = "1.0"
     task_id: UUID = Field(default_factory=uuid4)
     family: str = Field(min_length=1, pattern=r"^[a-z][a-z0-9_]*$")
     objective: str = Field(min_length=1, max_length=4_000)
@@ -118,6 +125,11 @@ class TaskSpec(ContractModel):
     def validate_workspace(cls, value: str) -> str:
         return normalize_relative_path(value)
 
+    @field_validator("inputs", mode="after")
+    @classmethod
+    def freeze_inputs(cls, value: Any) -> FrozenDict:
+        return freeze_json_object(value)
+
     @field_validator("created_at")
     @classmethod
     def require_timezone(cls, value: datetime) -> datetime:
@@ -125,16 +137,26 @@ class TaskSpec(ContractModel):
             raise ValueError("created_at must be timezone-aware")
         return value
 
+    @model_validator(mode="after")
+    def require_verifiable_outcome(self) -> Self:
+        if not any(condition.required for condition in self.postconditions):
+            raise ValueError("TaskSpec requires at least one required postcondition")
+        return self
+
 
 class Action(ContractModel):
     action_id: UUID = Field(default_factory=uuid4)
     capability: str = Field(min_length=1, pattern=r"^[a-z][a-z0-9_]*$")
     arguments: dict[str, Any] = Field(default_factory=dict)
-    timeout_seconds: int = Field(default=10, gt=0, le=600)
+
+    @field_validator("arguments", mode="after")
+    @classmethod
+    def freeze_arguments(cls, value: Any) -> FrozenDict:
+        return freeze_json_object(value)
 
 
 class ExecutionPlan(ContractModel):
-    schema_version: str = "1.0"
+    schema_version: Literal["1.0"] = "1.0"
     plan_id: UUID = Field(default_factory=uuid4)
     task_id: UUID
     planner_kind: PlannerKind
@@ -144,6 +166,9 @@ class ExecutionPlan(ContractModel):
 
     @model_validator(mode="after")
     def validate_knowledge_source(self) -> Self:
+        action_ids = [action.action_id for action in self.actions]
+        if len(action_ids) != len(set(action_ids)):
+            raise ValueError("action_id values must be unique within a plan")
         if self.planner_kind in {PlannerKind.COMPILED, PlannerKind.HEURISTIC}:
             if self.knowledge_artifact_id is None:
                 raise ValueError("known-knowledge plans require knowledge_artifact_id")
@@ -159,22 +184,40 @@ class Evidence(ContractModel):
     sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     metadata: dict[str, Any] = Field(default_factory=dict)
 
+    @field_validator("metadata", mode="after")
+    @classmethod
+    def freeze_metadata(cls, value: Any) -> FrozenDict:
+        return freeze_json_object(value)
+
 
 class VerificationReport(ContractModel):
     report_id: UUID = Field(default_factory=uuid4)
     task_id: UUID
     attempt_id: UUID
     verdict: VerificationVerdict
+    required_postconditions: frozenset[int] = frozenset()
     covered_postconditions: frozenset[int] = frozenset()
     evidence: tuple[Evidence, ...] = ()
     errors: tuple[str, ...] = ()
     verifier_version: str = Field(min_length=1)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
+    @field_validator("created_at")
+    @classmethod
+    def require_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("created_at must be timezone-aware")
+        return value
+
     @model_validator(mode="after")
     def validate_verdict_details(self) -> Self:
         if self.verdict is VerificationVerdict.PASSED and self.errors:
             raise ValueError("a passed report cannot contain errors")
+        if self.verdict is VerificationVerdict.PASSED:
+            if not self.required_postconditions.issubset(self.covered_postconditions):
+                raise ValueError("passed report must cover all required postconditions")
+            if not self.evidence:
+                raise ValueError("passed report must contain evidence")
         if self.verdict is not VerificationVerdict.PASSED and not self.errors:
             raise ValueError("failed or inconclusive reports must explain the result")
         if any(index < 0 for index in self.covered_postconditions):

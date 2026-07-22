@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from uuid import UUID, uuid4
 
-from pydantic import Field
+from pydantic import Field, field_validator
 
 from llmin.domain.models import ContractModel
 from llmin.observability.trace import TraceEvent, TraceSink
@@ -51,6 +51,13 @@ class TransitionRecord(ContractModel):
     to_state: TaskState
     reason: str = Field(min_length=1, max_length=1_000)
     occurred_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+    @field_validator("occurred_at")
+    @classmethod
+    def require_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("occurred_at must be timezone-aware")
+        return value
 
 
 class OrchestratorRun:

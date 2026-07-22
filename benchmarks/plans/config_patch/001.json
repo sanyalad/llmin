@@ -1,0 +1,18 @@
+{
+  "schema_version": "1.0",
+  "plan_id": "af93f91a-c294-46ac-aef1-77d22b257f49",
+  "task_id": "fa87df0d-1dc6-4c58-8541-6c4285ef93e7",
+  "planner_kind": "fake",
+  "actions": [
+    {
+      "action_id": "530f0d25-5039-466a-a326-c28cb33d29f5",
+      "capability": "patch_toml",
+      "arguments": {
+        "path": "config.toml",
+        "key": "service.timeout",
+        "value": 30
+      }
+    }
+  ],
+  "estimated_cost_usd": "0"
+}
