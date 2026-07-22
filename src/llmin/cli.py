@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 from pathlib import Path
 from typing import Annotated
 
@@ -10,6 +11,7 @@ import typer
 from pydantic import ValidationError
 
 from llmin import __version__
+from llmin.benchmark import BenchmarkRunner, BenchmarkSplit, BenchmarkSuite
 from llmin.domain import ExecutionPlan, TaskSpec
 from llmin.execution import CapabilityRegistry, Executor, SandboxFactory
 from llmin.observability import InMemoryTraceSink
@@ -105,6 +107,65 @@ def run_fixture(
     }
     typer.echo(json.dumps(summary, ensure_ascii=False, sort_keys=True))
     if result.final_state is not TaskState.COMPLETED:
+        raise typer.Exit(code=1)
+
+
+@app.command("benchmark")
+def run_benchmark(
+    suite_file: Annotated[
+        Path,
+        typer.Argument(exists=True, file_okay=True, dir_okay=False, readable=True),
+    ],
+    seed: Annotated[int, typer.Option(help="Deterministic case-order seed.")] = 0,
+    split: Annotated[
+        BenchmarkSplit | None,
+        typer.Option(help="Run only train, evidence, or holdout cases."),
+    ] = None,
+    output: Annotated[
+        Path | None,
+        typer.Option(help="Optional JSON report path."),
+    ] = None,
+) -> None:
+    """Run a reproducible benchmark suite and enforce its quality gate."""
+
+    try:
+        suite = BenchmarkSuite.model_validate_json(suite_file.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValidationError) as error:
+        typer.echo(f"invalid benchmark suite: {error}", err=True)
+        raise typer.Exit(code=2) from error
+
+    with tempfile.TemporaryDirectory(prefix="llmin-benchmark-") as temporary_directory:
+        report = BenchmarkRunner().run(
+            suite,
+            run_root=Path(temporary_directory),
+            seed=seed,
+            selected_split=split,
+        )
+
+    report_json = report.model_dump_json(indent=2)
+    if output is not None:
+        if not output.parent.exists() or not output.parent.is_dir():
+            typer.echo("invalid output: parent directory does not exist", err=True)
+            raise typer.Exit(code=2)
+        output.write_text(report_json + "\n", encoding="utf-8", newline="\n")
+
+    typer.echo(
+        json.dumps(
+            {
+                "suite": report.suite_name,
+                "suite_fingerprint": report.suite_fingerprint,
+                "observed_outcome_fingerprint": report.observed_outcome_fingerprint,
+                "evaluation_fingerprint": report.evaluation_fingerprint,
+                "cases": report.metrics.total_cases,
+                "matched": report.metrics.matched_cases,
+                "unsafe_acceptances": report.metrics.unsafe_acceptances,
+                "quality_gate_passed": report.metrics.quality_gate_passed,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+    if not report.metrics.quality_gate_passed:
         raise typer.Exit(code=1)
 
 

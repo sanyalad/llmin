@@ -1,0 +1,180 @@
+{
+  "schema_version": "1.0",
+  "name": "stage1_foundation",
+  "created_at": "2026-07-22T00:00:00Z",
+  "cases": [
+    {
+      "case_id": "train_timeout_30",
+      "split": "train",
+      "mode": "patch_toml",
+      "initial_toml": "[service]\ntimeout = 10\n",
+      "key": "service.timeout",
+      "action_value": 30,
+      "expected_value": 30,
+      "expected": {"final_state": "completed", "execution_success": true, "verification_verdict": "passed"}
+    },
+    {
+      "case_id": "train_timeout_15",
+      "split": "train",
+      "mode": "patch_toml",
+      "initial_toml": "[service]\ntimeout = 5\n",
+      "key": "service.timeout",
+      "action_value": 15,
+      "expected_value": 15,
+      "expected": {"final_state": "completed", "execution_success": true, "verification_verdict": "passed"}
+    },
+    {
+      "case_id": "train_enable_service",
+      "split": "train",
+      "mode": "patch_toml",
+      "initial_toml": "[service]\nenabled = false\n",
+      "key": "service.enabled",
+      "action_value": true,
+      "expected_value": true,
+      "expected": {"final_state": "completed", "execution_success": true, "verification_verdict": "passed"}
+    },
+    {
+      "case_id": "train_name_beta",
+      "split": "train",
+      "mode": "patch_toml",
+      "initial_toml": "[service]\nname = \"alpha\"\n",
+      "key": "service.name",
+      "action_value": "beta",
+      "expected_value": "beta",
+      "expected": {"final_state": "completed", "execution_success": true, "verification_verdict": "passed"}
+    },
+    {
+      "case_id": "evidence_root_retries",
+      "split": "evidence",
+      "mode": "patch_toml",
+      "initial_toml": "retries = 1\n",
+      "key": "retries",
+      "action_value": 3,
+      "expected_value": 3,
+      "expected": {"final_state": "completed", "execution_success": true, "verification_verdict": "passed"}
+    },
+    {
+      "case_id": "evidence_negative_to_zero",
+      "split": "evidence",
+      "mode": "patch_toml",
+      "initial_toml": "[limits]\nminimum = -5\n",
+      "key": "limits.minimum",
+      "action_value": 0,
+      "expected_value": 0,
+      "expected": {"final_state": "completed", "execution_success": true, "verification_verdict": "passed"}
+    },
+    {
+      "case_id": "evidence_unicode_name",
+      "split": "evidence",
+      "mode": "patch_toml",
+      "initial_toml": "[service]\nname = \"old\"\n",
+      "key": "service.name",
+      "action_value": "сервис-β",
+      "expected_value": "сервис-β",
+      "expected": {"final_state": "completed", "execution_success": true, "verification_verdict": "passed"}
+    },
+    {
+      "case_id": "holdout_max_connections",
+      "split": "holdout",
+      "mode": "patch_toml",
+      "initial_toml": "[database]\nmax_connections = 20\n",
+      "key": "database.max_connections",
+      "action_value": 100,
+      "expected_value": 100,
+      "expected": {"final_state": "completed", "execution_success": true, "verification_verdict": "passed"}
+    },
+    {
+      "case_id": "holdout_disable_cache",
+      "split": "holdout",
+      "mode": "patch_toml",
+      "initial_toml": "[cache]\nenabled = true\n",
+      "key": "cache.enabled",
+      "action_value": false,
+      "expected_value": false,
+      "expected": {"final_state": "completed", "execution_success": true, "verification_verdict": "passed"}
+    },
+    {
+      "case_id": "holdout_mutation_wrong_timeout",
+      "split": "holdout",
+      "mode": "patch_toml",
+      "initial_toml": "[service]\ntimeout = 10\n",
+      "key": "service.timeout",
+      "action_value": 31,
+      "expected_value": 30,
+      "mutation_expected_rejection": true,
+      "expected": {"final_state": "failed", "execution_success": true, "verification_verdict": "failed"}
+    },
+    {
+      "case_id": "holdout_mutation_wrong_flag",
+      "split": "holdout",
+      "mode": "patch_toml",
+      "initial_toml": "[feature]\nenabled = false\n",
+      "key": "feature.enabled",
+      "action_value": false,
+      "expected_value": true,
+      "mutation_expected_rejection": true,
+      "expected": {"final_state": "failed", "execution_success": true, "verification_verdict": "failed"}
+    },
+    {
+      "case_id": "holdout_mutation_true_vs_one",
+      "split": "holdout",
+      "mode": "patch_toml",
+      "initial_toml": "[feature]\nenabled = false\n",
+      "key": "feature.enabled",
+      "action_value": 1,
+      "expected_value": true,
+      "mutation_expected_rejection": true,
+      "expected": {"final_state": "failed", "execution_success": true, "verification_verdict": "failed"}
+    },
+    {
+      "case_id": "holdout_mutation_false_vs_zero",
+      "split": "holdout",
+      "mode": "patch_toml",
+      "initial_toml": "[feature]\nenabled = true\n",
+      "key": "feature.enabled",
+      "action_value": 0,
+      "expected_value": false,
+      "mutation_expected_rejection": true,
+      "expected": {"final_state": "failed", "execution_success": true, "verification_verdict": "failed"}
+    },
+    {
+      "case_id": "holdout_mutation_integer_vs_float",
+      "split": "holdout",
+      "mode": "patch_toml",
+      "initial_toml": "[limits]\nvalue = 0\n",
+      "key": "limits.value",
+      "action_value": 1,
+      "expected_value": 1.0,
+      "mutation_expected_rejection": true,
+      "expected": {"final_state": "failed", "execution_success": true, "verification_verdict": "failed"}
+    },
+    {
+      "case_id": "holdout_mutation_string_vs_integer",
+      "split": "holdout",
+      "mode": "patch_toml",
+      "initial_toml": "[limits]\nvalue = 0\n",
+      "key": "limits.value",
+      "action_value": "1",
+      "expected_value": 1,
+      "mutation_expected_rejection": true,
+      "expected": {"final_state": "failed", "execution_success": true, "verification_verdict": "failed"}
+    },
+    {
+      "case_id": "holdout_missing_key",
+      "split": "holdout",
+      "mode": "capability_error",
+      "initial_toml": "[service]\ntimeout = 10\n",
+      "key": "service.missing",
+      "action_value": 30,
+      "expected_value": 30,
+      "expected": {"final_state": "failed", "execution_success": false, "verification_verdict": null}
+    },
+    {
+      "case_id": "holdout_incompatible_capability",
+      "split": "holdout",
+      "mode": "incompatible",
+      "initial_toml": "",
+      "expected": {"final_state": "failed", "execution_success": null, "verification_verdict": null}
+    }
+  ]
+}

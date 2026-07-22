@@ -1,0 +1,13 @@
+{
+  "schema_version": "1.0",
+  "suite_name": "stage1_foundation",
+  "suite_fingerprint": "2d6c285e7f3f15535e9fad2870309724e76f3037fdda36e0185388dc0739e2c1",
+  "observed_outcome_fingerprint": "fb291ee6ce42bfa460073a25a71e099eb5ed590cca4a09133ab4f6e754f410d0",
+  "evaluation_fingerprint": "e4016d8824f5df342cfb51bcd47bcf33f25cf2458a5f9c8bb5a9d88cdeddccdb",
+  "total_cases": 17,
+  "matched_cases": 17,
+  "mutation_cases": 6,
+  "safe_rejections": 6,
+  "unsafe_acceptances": 0,
+  "quality_gate_passed": true
+}

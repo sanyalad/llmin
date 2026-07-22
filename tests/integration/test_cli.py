@@ -47,3 +47,47 @@ def test_run_fixture_reaches_verified_terminal_state(tmp_path: Path) -> None:
     assert summary["execution_success"] is True
     assert summary["verification_verdict"] == "passed"
     assert summary["trace_events"] > 0
+
+
+def test_benchmark_command_writes_passing_report(tmp_path: Path) -> None:
+    output = tmp_path / "report.json"
+
+    result = runner.invoke(
+        app,
+        [
+            "benchmark",
+            "benchmarks/stage1-suite.json",
+            "--seed",
+            "11",
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 0
+    summary = json.loads(result.stdout)
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert summary["quality_gate_passed"] is True
+    assert summary["unsafe_acceptances"] == 0
+    assert report["metrics"]["total_cases"] == 17
+
+
+def test_benchmark_command_writes_report_when_quality_gate_fails(tmp_path: Path) -> None:
+    manifest = json.loads(Path("benchmarks/stage1-suite.json").read_text(encoding="utf-8"))
+    manifest["cases"][0]["expected"]["final_state"] = "failed"
+    manifest["cases"][0]["expected"]["verification_verdict"] = "failed"
+    suite = tmp_path / "failing-suite.json"
+    suite.write_text(json.dumps(manifest), encoding="utf-8")
+    output = tmp_path / "failed-report.json"
+
+    result = runner.invoke(
+        app,
+        ["benchmark", str(suite), "--seed", "0", "--output", str(output)],
+    )
+
+    assert result.exit_code == 1
+    summary = json.loads(result.stdout)
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert summary["quality_gate_passed"] is False
+    assert report["metrics"]["matched_cases"] == 16
+    assert report["metrics"]["quality_gate_passed"] is False

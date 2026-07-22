@@ -15,6 +15,7 @@ LLMIN — экспериментальная автономная агентна
 - [Локальная разработка](docs/development.md)
 - [Sandbox execution](docs/sandbox.md)
 - [Независимая верификация](docs/verification.md)
+- [Stage 1 benchmark](docs/benchmark.md)
 - [Как участвовать в разработке](CONTRIBUTING.md)
 
 ## Коротко об архитектуре
