@@ -10,21 +10,27 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID
 
-from llmin.domain import Evidence
+from llmin.domain import Evidence, ExecutionPlan, TaskSpec, VerificationReport
+from llmin.execution import ExecutionReport
 from llmin.memory.models import (
+    ArtifactBlob,
     ArtifactRelation,
     AttemptMemory,
+    AttemptRecord,
+    AttemptStatus,
     ContradictionRecord,
     ContradictionStatus,
     CostEntry,
+    EnvironmentRecord,
     Episode,
     EpisodeTransition,
     MemoryState,
     artifact_content_hash,
 )
 from llmin.observability import TraceEvent, redact
+from llmin.orchestrator import TaskState
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 _ALLOWED_TRANSITIONS = {
     MemoryState.ACTIVE: frozenset(
         {MemoryState.COLD, MemoryState.QUARANTINED, MemoryState.TOMBSTONED}
@@ -124,6 +130,103 @@ class SQLiteMemoryStore:
             evidence=tuple(Evidence.model_validate_json(row[0]) for row in evidence_rows),
             costs=tuple(CostEntry.model_validate_json(row[0]) for row in cost_rows),
         )
+
+    def begin_attempt(
+        self,
+        *,
+        attempt_id: UUID,
+        trace_id: UUID,
+        task: TaskSpec,
+        plan: ExecutionPlan | None,
+        environment: EnvironmentRecord,
+        created_at: datetime | None = None,
+    ) -> AttemptRecord:
+        record = AttemptRecord(
+            attempt_id=attempt_id,
+            trace_id=trace_id,
+            task=task,
+            plan=plan,
+            environment=environment,
+            created_at=created_at or datetime.now(UTC),
+        )
+        sanitized = AttemptRecord.model_validate(redact(record.model_dump()))
+        document = sanitized.model_dump_json()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._insert_environment(connection, sanitized.environment)
+            existing = connection.execute(
+                "SELECT document FROM attempts WHERE attempt_id = ?",
+                (str(attempt_id),),
+            ).fetchone()
+            if existing is not None:
+                self._require_identical(existing[0], document, "attempt")
+                return AttemptRecord.model_validate_json(existing[0])
+            connection.execute(
+                "INSERT INTO attempts(attempt_id, status, document) VALUES (?, ?, ?)",
+                (str(attempt_id), sanitized.status.value, document),
+            )
+        return sanitized
+
+    def finalize_attempt(
+        self,
+        attempt_id: UUID,
+        *,
+        final_state: TaskState,
+        execution_report: ExecutionReport | None,
+        verification_report: VerificationReport | None,
+        artifacts: tuple[ArtifactBlob, ...] = (),
+        finalized_at: datetime | None = None,
+    ) -> AttemptRecord:
+        timestamp = finalized_at or datetime.now(UTC)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT document FROM attempts WHERE attempt_id = ?",
+                (str(attempt_id),),
+            ).fetchone()
+            if row is None:
+                raise MemoryStoreError("attempt does not exist")
+            current = AttemptRecord.model_validate_json(row[0])
+            effective_finalized_at = (
+                current.finalized_at if current.status is AttemptStatus.FINALIZED else timestamp
+            )
+            candidate = AttemptRecord.model_validate(
+                redact(
+                    current.model_copy(
+                        update={
+                            "status": AttemptStatus.FINALIZED,
+                            "final_state": final_state,
+                            "execution_report": execution_report,
+                            "verification_report": verification_report,
+                            "artifacts": artifacts,
+                            "finalized_at": effective_finalized_at,
+                        }
+                    ).model_dump()
+                )
+            )
+            document = candidate.model_dump_json()
+            if current.status is AttemptStatus.FINALIZED:
+                self._require_identical(row[0], document, "finalized attempt")
+                return current
+            if verification_report is not None:
+                persisted_verification = candidate.verification_report
+                if persisted_verification is None:
+                    raise MemoryStoreError("verification report was lost during sanitization")
+                for evidence in persisted_verification.evidence:
+                    self._insert_evidence(connection, candidate.attempt_id, evidence)
+            connection.execute(
+                "UPDATE attempts SET status = ?, document = ? WHERE attempt_id = ?",
+                (AttemptStatus.FINALIZED.value, document, str(attempt_id)),
+            )
+        return candidate
+
+    def get_attempt(self, attempt_id: UUID) -> AttemptRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT document FROM attempts WHERE attempt_id = ?",
+                (str(attempt_id),),
+            ).fetchone()
+        return AttemptRecord.model_validate_json(row[0]) if row is not None else None
 
     def create_episode(self, episode: Episode) -> None:
         if episode.state is not MemoryState.ACTIVE:
@@ -363,6 +466,45 @@ class SQLiteMemoryStore:
                 (identifier, str(attempt_id), document),
             )
 
+    def _insert_evidence(
+        self,
+        connection: sqlite3.Connection,
+        attempt_id: UUID,
+        evidence: Evidence,
+    ) -> None:
+        document = evidence.model_dump_json()
+        existing = connection.execute(
+            "SELECT document, attempt_id FROM evidence WHERE evidence_id = ?",
+            (str(evidence.evidence_id),),
+        ).fetchone()
+        if existing is not None:
+            if existing[1] != str(attempt_id):
+                raise MemoryStoreError("evidence identifier belongs to another attempt")
+            self._require_identical(existing[0], document, "evidence")
+            return
+        connection.execute(
+            "INSERT INTO evidence(evidence_id, attempt_id, document) VALUES (?, ?, ?)",
+            (str(evidence.evidence_id), str(attempt_id), document),
+        )
+
+    @staticmethod
+    def _insert_environment(
+        connection: sqlite3.Connection,
+        environment: EnvironmentRecord,
+    ) -> None:
+        document = environment.model_dump_json()
+        existing = connection.execute(
+            "SELECT document FROM environments WHERE fingerprint = ?",
+            (environment.fingerprint,),
+        ).fetchone()
+        if existing is not None and json.loads(existing[0]) != json.loads(document):
+            raise MemoryStoreError("environment fingerprint was reused with new content")
+        if existing is None:
+            connection.execute(
+                "INSERT INTO environments(fingerprint, document) VALUES (?, ?)",
+                (environment.fingerprint, document),
+            )
+
     @staticmethod
     def _require_identical(existing: str, candidate: str, kind: str) -> None:
         if json.loads(existing) != json.loads(candidate):
@@ -426,6 +568,15 @@ class SQLiteMemoryStore:
                     contradiction_id TEXT PRIMARY KEY,
                     document TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS environments (
+                    fingerprint TEXT PRIMARY KEY,
+                    document TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS attempts (
+                    attempt_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    document TEXT NOT NULL
+                );
                 """
             )
             row = connection.execute(
@@ -434,6 +585,11 @@ class SQLiteMemoryStore:
             if row is None:
                 connection.execute(
                     "INSERT INTO schema_metadata(singleton, version) VALUES (1, ?)",
+                    (_SCHEMA_VERSION,),
+                )
+            elif row[0] == 2:
+                connection.execute(
+                    "UPDATE schema_metadata SET version = ? WHERE singleton = 1",
                     (_SCHEMA_VERSION,),
                 )
             elif row[0] != _SCHEMA_VERSION:

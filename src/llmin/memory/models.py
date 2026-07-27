@@ -12,9 +12,18 @@ from uuid import UUID, uuid4
 
 from pydantic import Field, field_validator, model_validator
 
-from llmin.domain import ContractModel, Evidence, VerificationVerdict
+from llmin.domain import (
+    ContractModel,
+    Evidence,
+    ExecutionPlan,
+    TaskSpec,
+    VerificationReport,
+    VerificationVerdict,
+)
 from llmin.domain.json_types import FrozenDict, freeze_json_object
+from llmin.execution import ExecutionReport
 from llmin.observability import TraceEvent, redact
+from llmin.orchestrator import TaskState
 
 
 def artifact_content_hash(content: str) -> str:
@@ -29,6 +38,17 @@ def artifact_content_hash(content: str) -> str:
 
 
 episode_content_hash = artifact_content_hash
+
+
+def environment_content_hash(attributes: dict[str, Any]) -> str:
+    sanitized = redact(attributes)
+    encoded = json.dumps(
+        sanitized,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 class MemoryLayer(StrEnum):
@@ -147,6 +167,11 @@ class CostCategory(StrEnum):
     RETRIEVAL = "retrieval"
     REVALIDATION = "revalidation"
     DELETION = "deletion"
+
+
+class AttemptStatus(StrEnum):
+    OPEN = "open"
+    FINALIZED = "finalized"
 
 
 class RetentionPolicy(ContractModel):
@@ -365,4 +390,92 @@ class AttemptMemory(ContractModel):
             raise ValueError("trace event belongs to a different attempt")
         if any(cost.attempt_id != self.attempt_id for cost in self.costs):
             raise ValueError("cost entry belongs to a different attempt")
+        return self
+
+
+class EnvironmentRecord(ContractModel):
+    fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    attributes: dict[str, Any]
+
+    @field_validator("attributes", mode="after")
+    @classmethod
+    def freeze_attributes(cls, value: Any) -> FrozenDict:
+        return freeze_json_object(value)
+
+    @model_validator(mode="after")
+    def validate_fingerprint(self) -> Self:
+        if self.fingerprint != environment_content_hash(dict(self.attributes)):
+            raise ValueError("environment fingerprint does not match attributes")
+        return self
+
+
+class ArtifactBlob(ContractModel):
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    size_bytes: int = Field(ge=0)
+    media_type: str = Field(min_length=1, max_length=255)
+    logical_name: str = Field(min_length=1, max_length=1_000)
+
+
+class AttemptRecord(ContractModel):
+    schema_version: Literal["1.0"] = "1.0"
+    attempt_id: UUID
+    trace_id: UUID
+    task: TaskSpec
+    plan: ExecutionPlan | None = None
+    environment: EnvironmentRecord
+    status: AttemptStatus = AttemptStatus.OPEN
+    final_state: TaskState | None = None
+    execution_report: ExecutionReport | None = None
+    verification_report: VerificationReport | None = None
+    artifacts: tuple[ArtifactBlob, ...] = ()
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    finalized_at: datetime | None = None
+
+    @field_validator("created_at", "finalized_at")
+    @classmethod
+    def require_timezone(cls, value: datetime | None) -> datetime | None:
+        if value is not None and (value.tzinfo is None or value.utcoffset() is None):
+            raise ValueError("attempt timestamps must be timezone-aware")
+        return value
+
+    @model_validator(mode="after")
+    def validate_identity_and_state(self) -> Self:
+        if self.plan is not None and self.plan.task_id != self.task.task_id:
+            raise ValueError("attempt plan belongs to another task")
+        if self.execution_report is not None:
+            if self.execution_report.task_id != self.task.task_id:
+                raise ValueError("execution report belongs to another task")
+            if self.plan is None or self.execution_report.plan_id != self.plan.plan_id:
+                raise ValueError("execution report belongs to another plan")
+        if self.verification_report is not None:
+            if self.verification_report.task_id != self.task.task_id:
+                raise ValueError("verification report belongs to another task")
+            if self.verification_report.attempt_id != self.attempt_id:
+                raise ValueError("verification report belongs to another attempt")
+            if self.execution_report is None or not self.execution_report.success:
+                raise ValueError("verification report requires successful execution")
+        if self.status is AttemptStatus.OPEN:
+            if (
+                any(
+                    value is not None
+                    for value in (
+                        self.final_state,
+                        self.execution_report,
+                        self.verification_report,
+                        self.finalized_at,
+                    )
+                )
+                or self.artifacts
+            ):
+                raise ValueError("open attempts cannot contain finalized outputs")
+        elif self.final_state is None or self.finalized_at is None:
+            raise ValueError("finalized attempts require final state and timestamp")
+        if self.final_state is TaskState.COMPLETED:
+            if self.execution_report is None or not self.execution_report.success:
+                raise ValueError("completed attempts require successful execution")
+            if (
+                self.verification_report is None
+                or self.verification_report.verdict is not VerificationVerdict.PASSED
+            ):
+                raise ValueError("completed attempts require passed verification")
         return self

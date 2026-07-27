@@ -1,16 +1,21 @@
 """Governed memory contracts and persistence adapters."""
 
+from llmin.memory.artifacts import ArtifactStoreError, ContentAddressedArtifactStore
 from llmin.memory.models import (
     ActivationState,
     Applicability,
+    ArtifactBlob,
     ArtifactKind,
     ArtifactRelation,
     ArtifactVerifierResult,
     AttemptMemory,
+    AttemptRecord,
+    AttemptStatus,
     ContradictionRecord,
     ContradictionStatus,
     CostCategory,
     CostEntry,
+    EnvironmentRecord,
     Episode,
     EpisodeTransition,
     ExperimentArtifact,
@@ -23,21 +28,30 @@ from llmin.memory.models import (
     RetentionPolicy,
     RuleArtifact,
     artifact_content_hash,
+    environment_content_hash,
     episode_content_hash,
 )
+from llmin.memory.recorder import AttemptRecorder
 from llmin.memory.sqlite import MemoryStoreError, SQLiteMemoryStore
 
 __all__ = [
     "ActivationState",
     "Applicability",
+    "ArtifactBlob",
     "ArtifactKind",
     "ArtifactRelation",
+    "ArtifactStoreError",
     "ArtifactVerifierResult",
     "AttemptMemory",
+    "AttemptRecord",
+    "AttemptRecorder",
+    "AttemptStatus",
+    "ContentAddressedArtifactStore",
     "ContradictionRecord",
     "ContradictionStatus",
     "CostCategory",
     "CostEntry",
+    "EnvironmentRecord",
     "Episode",
     "EpisodeTransition",
     "ExperimentArtifact",
@@ -52,5 +66,6 @@ __all__ = [
     "RuleArtifact",
     "SQLiteMemoryStore",
     "artifact_content_hash",
+    "environment_content_hash",
     "episode_content_hash",
 ]
