@@ -364,7 +364,8 @@ Stage 1 должен измерять контекст с первого дня.
 - `uv` для окружения и lock-файла;
 - Pydantic v2 для контрактов;
 - Typer для CLI;
-- SQLite + SQLModel/SQLAlchemy для метаданных;
+- SQLite через стандартный `sqlite3` для Memory v0; SQLAlchemy вводится только при
+  измеренной сложности схемы или нескольких storage adapters;
 - pytest, Hypothesis и golden fixtures для тестов;
 - structlog или стандартный JSON logging;
 - OpenTelemetry-compatible trace identifiers без обязательного collector;
@@ -433,7 +434,24 @@ llmin/
 
 Критерий готовности: adversarial tests не позволяют выйти из sandbox; изменение вне allowlist приводит к fail и rollback.
 
-### Неделя 3 — LLM fallback, Context Compiler и Economist v0
+### Неделя 3 — Memory v0, журнал доказательств и cost ledger
+
+Результат: попытки воспроизводимы, а память имеет provenance и явную retention-политику до
+появления первого реального LLM-вызова.
+
+- Реализовать append-only SQLite journal для redacted traces, evidence и costs.
+- Разделить evidence journal и управляемые memory objects.
+- Зафиксировать общий MemoryArtifact, Provenance, Applicability и ArtifactRelation.
+- Сохранять contradictions и отвергнутые ExperimentArtifact без автоматического разрешения.
+- Определить episodic lifecycle: active, cold, quarantined, tombstoned.
+- Зафиксировать provenance и environment compatibility.
+- Реализовать reconstruction попытки без загрузки истории в LLM context.
+- Добавить аудит переходов и forgetting decisions.
+
+Критерий готовности: завершённая попытка восстанавливается из journal; секреты не попадают в
+SQLite; episode нельзя создать без provenance и retention policy; удаление оставляет tombstone.
+
+### Неделя 4 — LLM fallback, Context Compiler и Economist v0
 
 Результат: неизвестная задача планируется через заменяемый LLM provider в пределах бюджета.
 
@@ -446,11 +464,10 @@ llmin/
 
 Критерий готовности: ни один LLM-ответ не исполняется до schema/policy validation; budget нельзя изменить через prompt.
 
-### Неделя 4 — память, mining и первая кристаллизация
+### Неделя 5 — mining и первая кристаллизация
 
 Результат: повторяющиеся успешные traces создают проверяемого кандидата.
 
-- Реализовать SQLite repositories и artifact store.
 - Группировать traces по task family и сигнатуре действий.
 - Выделять параметры и общую последовательность.
 - Формировать candidate с preconditions и exclusions.
@@ -459,7 +476,7 @@ llmin/
 
 Критерий готовности: кандидат имеет provenance до исходных traces и не может повысить собственный статус.
 
-### Неделя 5 — compiled skill, routing и обратная эволюция
+### Неделя 6 — compiled skill, routing и обратная эволюция
 
 Результат: известная задача решается без LLM, а деградировавшее знание автоматически отключается.
 
@@ -472,7 +489,7 @@ llmin/
 
 Критерий готовности: после инъекции дрейфа compiled skill перестаёт применяться, событие объяснимо, задача безопасно возвращается к fallback.
 
-### Неделя 6 — benchmark, отчёт и решение о Stage 2
+### Завершение Stage 1 — benchmark, отчёт и решение о Stage 2
 
 Результат: воспроизводимый отчёт подтверждает или опровергает основную гипотезу.
 
@@ -585,7 +602,10 @@ Candidate mining, evaluation, registry, routing, promotion/demotion.
 
 Task families, holdout, statistical report, reproducibility command.
 
-Порядок зависимостей: E1 → E2/E3 → E4/E5 → E6 → E7. E7 начинается в первую неделю как инфраструктура и завершается последней как отчёт.
+Порядок зависимостей после manifesto 0.3: E1 → E2/E3 → E5 → E4 → E6 → E7. E7
+начинается в первую неделю как инфраструктура и завершается последней как отчёт. E5
+предшествует реальному LLM provider, чтобы вызовы, стоимость и provenance измерялись с
+первого запуска.
 
 ## 17. Definition of Done для любой функции
 
