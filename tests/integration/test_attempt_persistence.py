@@ -1,3 +1,4 @@
+import hashlib
 import shutil
 import sqlite3
 from pathlib import Path
@@ -7,6 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 from llmin.domain import ExecutionPlan, TaskSpec
+from llmin.domain.json_types import canonical_json
 from llmin.execution import CapabilityRegistry, Executor, SandboxFactory
 from llmin.memory import (
     ArtifactStoreError,
@@ -14,6 +16,7 @@ from llmin.memory import (
     AttemptStatus,
     ContentAddressedArtifactStore,
     EnvironmentRecord,
+    MemoryStoreError,
     SQLiteMemoryStore,
     environment_content_hash,
 )
@@ -122,6 +125,37 @@ def test_artifact_store_rejects_secrets_and_detects_tampering(tmp_path: Path) ->
         store.read(blob)
 
 
+def test_artifact_store_enforces_declared_format_and_quota(tmp_path: Path) -> None:
+    store = ContentAddressedArtifactStore(
+        tmp_path / "artifacts", max_blob_bytes=32, max_total_bytes=34
+    )
+
+    with pytest.raises(ArtifactStoreError, match="declared application/json"):
+        store.put(b"not json", logical_name="payload.json", media_type="application/json")
+    with pytest.raises(ArtifactStoreError, match="per-blob quota"):
+        store.put(b"x" * 33, logical_name="large.txt")
+
+    store.put(b"one", logical_name="one.txt")
+    with pytest.raises(ArtifactStoreError, match="total quota"):
+        store.put(b"x" * 32, logical_name="two.txt")
+
+
+def test_artifact_store_rejects_symlink_shard(tmp_path: Path) -> None:
+    store = ContentAddressedArtifactStore(tmp_path / "artifacts")
+    payload = b"safe"
+    digest = hashlib.sha256(payload).hexdigest()
+    target = tmp_path / "outside"
+    target.mkdir()
+    shard = store.root / digest[:2]
+    try:
+        shard.symlink_to(target, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink creation is unavailable on this Windows configuration")
+
+    with pytest.raises(ArtifactStoreError, match="symlink or reparse point"):
+        store.put(payload, logical_name="safe.txt")
+
+
 def test_failed_finalization_leaves_attempt_open_and_evidence_absent(tmp_path: Path) -> None:
     memory = SQLiteMemoryStore(tmp_path / "memory.sqlite3")
     task, _workspace, result = run_fixture(tmp_path, memory)
@@ -167,6 +201,68 @@ def test_rejected_artifact_leaves_retryable_open_attempt(tmp_path: Path) -> None
 
     stored = memory.get_attempt(result.attempt_id)
     assert stored is not None and stored.status is AttemptStatus.OPEN
+
+
+def test_begin_attempt_is_idempotent_without_explicit_timestamp(tmp_path: Path) -> None:
+    memory = SQLiteMemoryStore(tmp_path / "memory.sqlite3")
+    task, _workspace, result = run_fixture(tmp_path, memory)
+    environment = EnvironmentRecord(
+        fingerprint=environment_content_hash({"os": "test"}),
+        attributes={"os": "test"},
+    )
+
+    first = memory.begin_attempt(
+        attempt_id=result.attempt_id,
+        trace_id=result.trace_id,
+        task=task,
+        plan=result.execution_plan,
+        environment=environment,
+    )
+    second = memory.begin_attempt(
+        attempt_id=result.attempt_id,
+        trace_id=result.trace_id,
+        task=task,
+        plan=result.execution_plan,
+        environment=environment,
+    )
+
+    assert first == second
+
+
+def test_recorder_rejects_result_for_another_task(tmp_path: Path) -> None:
+    memory = SQLiteMemoryStore(tmp_path / "memory.sqlite3")
+    artifacts = ContentAddressedArtifactStore(tmp_path / "artifacts")
+    task, _workspace, result = run_fixture(tmp_path, memory)
+    foreign_task = task.model_copy(update={"task_id": uuid4()})
+
+    with pytest.raises(MemoryStoreError, match="another task"):
+        AttemptRecorder(memory=memory, artifacts=artifacts).record(
+            task=foreign_task,
+            result=result,
+            environment_attributes={"os": "test"},
+        )
+
+
+def test_canonical_contract_serialization_sorts_set_fields(tmp_path: Path) -> None:
+    task, _workspace, _result = run_fixture(
+        tmp_path, SQLiteMemoryStore(tmp_path / "memory.sqlite3")
+    )
+    first = task.model_copy(
+        update={
+            "constraints": task.constraints.model_copy(
+                update={"allowed_capabilities": frozenset({"b", "a"})}
+            )
+        }
+    )
+    second = task.model_copy(
+        update={
+            "constraints": task.constraints.model_copy(
+                update={"allowed_capabilities": frozenset({"a", "b"})}
+            )
+        }
+    )
+
+    assert canonical_json(first) == canonical_json(second)
 
 
 def test_schema_v2_database_is_migrated_to_v3(tmp_path: Path) -> None:

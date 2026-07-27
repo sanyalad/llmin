@@ -231,6 +231,8 @@ class Episode(MemoryArtifact):
             raise ValueError("non-tombstoned episodes require a summary")
         if not self.provenance.source_event_ids or not self.provenance.evidence_ids:
             raise ValueError("episodes require trace and evidence provenance")
+        if not self.applicability.environment_fingerprints:
+            raise ValueError("episodes require at least one environment fingerprint")
         return self
 
 

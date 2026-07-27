@@ -11,6 +11,7 @@ from pathlib import Path
 from uuid import UUID
 
 from llmin.domain import Evidence, ExecutionPlan, TaskSpec, VerificationReport
+from llmin.domain.json_types import canonical_json
 from llmin.execution import ExecutionReport
 from llmin.memory.models import (
     ArtifactBlob,
@@ -60,7 +61,7 @@ class SQLiteMemoryStore:
         sanitized = TraceEvent.model_validate(
             {**event.model_dump(), "payload": redact(event.payload)}
         )
-        document = sanitized.model_dump_json()
+        document = canonical_json(sanitized)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
@@ -87,7 +88,7 @@ class SQLiteMemoryStore:
 
     def append_evidence(self, attempt_id: UUID, evidence: Evidence) -> None:
         sanitized = Evidence.model_validate(redact(evidence.model_dump()))
-        document = sanitized.model_dump_json()
+        document = canonical_json(sanitized)
         self._insert_immutable(
             table="evidence",
             identifier_column="evidence_id",
@@ -106,7 +107,7 @@ class SQLiteMemoryStore:
             identifier_column="cost_id",
             identifier=str(sanitized.cost_id),
             attempt_id=sanitized.attempt_id,
-            document=sanitized.model_dump_json(),
+            document=canonical_json(sanitized),
             kind="cost entry",
         )
 
@@ -141,26 +142,34 @@ class SQLiteMemoryStore:
         environment: EnvironmentRecord,
         created_at: datetime | None = None,
     ) -> AttemptRecord:
-        record = AttemptRecord(
-            attempt_id=attempt_id,
-            trace_id=trace_id,
-            task=task,
-            plan=plan,
-            environment=environment,
-            created_at=created_at or datetime.now(UTC),
-        )
-        sanitized = AttemptRecord.model_validate(redact(record.model_dump()))
-        document = sanitized.model_dump_json()
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            self._insert_environment(connection, sanitized.environment)
             existing = connection.execute(
                 "SELECT document FROM attempts WHERE attempt_id = ?",
                 (str(attempt_id),),
             ).fetchone()
             if existing is not None:
-                self._require_identical(existing[0], document, "attempt")
-                return AttemptRecord.model_validate_json(existing[0])
+                current = AttemptRecord.model_validate_json(existing[0])
+                self._require_attempt_envelope(
+                    current,
+                    trace_id=trace_id,
+                    task=task,
+                    plan=plan,
+                    environment=environment,
+                )
+                return current
+            record = AttemptRecord(
+                attempt_id=attempt_id,
+                trace_id=trace_id,
+                task=task,
+                plan=plan,
+                environment=environment,
+                created_at=created_at or datetime.now(UTC),
+            )
+            sanitized = AttemptRecord.model_validate(redact(record.model_dump()))
+            self._validate_existing_trace_identity(connection, sanitized)
+            self._insert_environment(connection, sanitized.environment)
+            document = canonical_json(sanitized)
             connection.execute(
                 "INSERT INTO attempts(attempt_id, status, document) VALUES (?, ?, ?)",
                 (str(attempt_id), sanitized.status.value, document),
@@ -204,7 +213,8 @@ class SQLiteMemoryStore:
                     ).model_dump()
                 )
             )
-            document = candidate.model_dump_json()
+            self._validate_existing_trace_identity(connection, candidate)
+            document = canonical_json(candidate)
             if current.status is AttemptStatus.FINALIZED:
                 self._require_identical(row[0], document, "finalized attempt")
                 return current
@@ -236,7 +246,7 @@ class SQLiteMemoryStore:
             sanitized.summary
         ):
             raise MemoryStoreError("episode content hash does not match sanitized payload")
-        document = sanitized.model_dump_json()
+        document = canonical_json(sanitized)
         with self._connect() as connection:
             existing = connection.execute(
                 "SELECT document FROM episodes WHERE episode_id = ?",
@@ -263,7 +273,7 @@ class SQLiteMemoryStore:
                 table="artifact_relations",
                 identifier_column="relation_id",
                 identifier=sanitized.relation_id,
-                document=sanitized.model_dump_json(),
+                document=canonical_json(sanitized),
                 kind="artifact relation",
             )
 
@@ -288,7 +298,7 @@ class SQLiteMemoryStore:
                 table="contradictions",
                 identifier_column="contradiction_id",
                 identifier=sanitized.contradiction_id,
-                document=sanitized.model_dump_json(),
+                document=canonical_json(sanitized),
                 kind="contradiction",
             )
 
@@ -356,7 +366,7 @@ class SQLiteMemoryStore:
             )
             connection.execute(
                 "UPDATE episodes SET state = ?, document = ? WHERE episode_id = ?",
-                (target.value, updated.model_dump_json(), str(episode_id)),
+                (target.value, canonical_json(updated), str(episode_id)),
             )
             connection.execute(
                 "INSERT INTO episode_transitions(transition_id, episode_id, document) "
@@ -364,7 +374,7 @@ class SQLiteMemoryStore:
                 (
                     str(transition.transition_id),
                     str(episode_id),
-                    transition.model_dump_json(),
+                    canonical_json(transition),
                 ),
             )
         return transition
@@ -403,6 +413,40 @@ class SQLiteMemoryStore:
                 raise MemoryStoreError("episode references unknown evidence")
             if row[0] != str(episode.attempt_id):
                 raise MemoryStoreError("episode evidence belongs to another attempt")
+        attempt_row = connection.execute(
+            "SELECT document FROM attempts WHERE attempt_id = ?",
+            (str(episode.attempt_id),),
+        ).fetchone()
+        if episode.provenance.verification_report_ids:
+            if attempt_row is None:
+                raise MemoryStoreError("episode report provenance requires a persisted attempt")
+            attempt = AttemptRecord.model_validate_json(attempt_row[0])
+            report = attempt.verification_report
+            if report is None or report.task_id != episode.task_id:
+                raise MemoryStoreError(
+                    "episode report provenance belongs to another task or attempt"
+                )
+            if set(episode.provenance.verification_report_ids) != {report.report_id}:
+                raise MemoryStoreError("episode references an unknown verification report")
+            evidence_ids = {evidence.evidence_id for evidence in report.evidence}
+            if not episode.provenance.evidence_ids.issubset(evidence_ids):
+                raise MemoryStoreError("episode evidence is absent from its verification report")
+        if attempt_row is not None:
+            attempt = AttemptRecord.model_validate_json(attempt_row[0])
+            if attempt.task.task_id != episode.task_id:
+                raise MemoryStoreError("episode attempt provenance belongs to another task")
+            if (
+                attempt.environment.fingerprint
+                not in episode.applicability.environment_fingerprints
+            ):
+                raise MemoryStoreError("episode applicability omits its source environment")
+        for parent_id in episode.provenance.parent_artifact_ids:
+            row = connection.execute(
+                "SELECT 1 FROM episodes WHERE episode_id = ?",
+                (str(parent_id),),
+            ).fetchone()
+            if row is None:
+                raise MemoryStoreError("episode references an unknown parent artifact")
 
     @staticmethod
     def _require_artifacts_exist(
@@ -472,7 +516,7 @@ class SQLiteMemoryStore:
         attempt_id: UUID,
         evidence: Evidence,
     ) -> None:
-        document = evidence.model_dump_json()
+        document = canonical_json(evidence)
         existing = connection.execute(
             "SELECT document, attempt_id FROM evidence WHERE evidence_id = ?",
             (str(evidence.evidence_id),),
@@ -492,12 +536,12 @@ class SQLiteMemoryStore:
         connection: sqlite3.Connection,
         environment: EnvironmentRecord,
     ) -> None:
-        document = environment.model_dump_json()
+        document = canonical_json(environment)
         existing = connection.execute(
             "SELECT document FROM environments WHERE fingerprint = ?",
             (environment.fingerprint,),
         ).fetchone()
-        if existing is not None and json.loads(existing[0]) != json.loads(document):
+        if existing is not None and canonical_json(json.loads(existing[0])) != document:
             raise MemoryStoreError("environment fingerprint was reused with new content")
         if existing is None:
             connection.execute(
@@ -506,8 +550,43 @@ class SQLiteMemoryStore:
             )
 
     @staticmethod
+    def _require_attempt_envelope(
+        existing: AttemptRecord,
+        *,
+        trace_id: UUID,
+        task: TaskSpec,
+        plan: ExecutionPlan | None,
+        environment: EnvironmentRecord,
+    ) -> None:
+        sanitized_task = TaskSpec.model_validate(redact(task.model_dump()))
+        sanitized_plan = (
+            ExecutionPlan.model_validate(redact(plan.model_dump())) if plan is not None else None
+        )
+        if (
+            existing.trace_id != trace_id
+            or existing.task != sanitized_task
+            or existing.plan != sanitized_plan
+            or existing.environment != environment
+        ):
+            raise MemoryStoreError("attempt identifier was reused with different inputs")
+
+    @staticmethod
+    def _validate_existing_trace_identity(
+        connection: sqlite3.Connection,
+        attempt: AttemptRecord,
+    ) -> None:
+        rows = connection.execute(
+            "SELECT document FROM trace_events WHERE attempt_id = ? ORDER BY sequence",
+            (str(attempt.attempt_id),),
+        ).fetchall()
+        for row in rows:
+            event = TraceEvent.model_validate_json(row[0])
+            if event.trace_id != attempt.trace_id or event.task_id != attempt.task.task_id:
+                raise MemoryStoreError("attempt trace belongs to another task or trace")
+
+    @staticmethod
     def _require_identical(existing: str, candidate: str, kind: str) -> None:
-        if json.loads(existing) != json.loads(candidate):
+        if canonical_json(json.loads(existing)) != canonical_json(json.loads(candidate)):
             raise MemoryStoreError(f"immutable {kind} identifier was reused with new content")
 
     @contextmanager

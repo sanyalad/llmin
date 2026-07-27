@@ -35,6 +35,8 @@ class AttemptRecorder:
         environment_attributes: dict[str, object],
         artifact_payloads: Mapping[str, tuple[bytes, str]] | None = None,
     ) -> AttemptRecord:
+        if result.task_id != task.task_id:
+            raise MemoryStoreError("pipeline result belongs to another task")
         sanitized_environment = redact(environment_attributes)
         environment = EnvironmentRecord(
             fingerprint=environment_content_hash(sanitized_environment),

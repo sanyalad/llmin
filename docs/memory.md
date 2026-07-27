@@ -6,8 +6,9 @@ governed memory objects.
 
 ## Complete attempts
 
-Every `PipelineResult`, including failures before execution, exposes the pipeline `trace_id`,
-`attempt_id`, and the execution plan when one exists. `AttemptRecorder` turns that result into
+Every `PipelineResult`, including failures before execution, exposes the pipeline `task_id`,
+`trace_id`, `attempt_id`, and the execution plan when one exists. `AttemptRecorder` rejects a
+result whose task differs from the supplied `TaskSpec` and turns a matching result into
 an `AttemptRecord` containing:
 
 - the complete redacted `TaskSpec`;
@@ -18,8 +19,10 @@ an `AttemptRecord` containing:
 
 Recording has two explicit phases. `begin_attempt()` creates an `open` record, and
 `finalize_attempt()` atomically commits terminal metadata and verifier evidence in one SQLite
-transaction. Repeating either operation with identical content is idempotent. Reusing an
-identifier for different content is rejected.
+transaction. Repeating either operation with identical content is idempotent, including direct
+`begin_attempt()` retries that do not supply a timestamp. Reusing an identifier for different
+content is rejected. SQLite identity comparisons use a canonical JSON encoding that sorts only
+unordered set-like fields; declared list and tuple order remains meaningful.
 
 An attempt marked `completed` is valid only when execution succeeded and independent
 verification passed. Cross-task, cross-plan, and cross-attempt report references are rejected
@@ -33,9 +36,11 @@ Writes use a temporary file, flush, filesystem sync, atomic replacement, and ver
 both existing and newly read content. A digest collision with different content or later
 tampering is rejected.
 
-Stage 1 accepts only `text/plain`, `application/json`, and `application/toml`. Content rejected
-by the existing secret-redaction boundary is not stored. Binary artifacts and media-specific
-sanitizers are deliberately deferred.
+Stage 1 accepts only `text/plain`, `application/json`, and `application/toml`; JSON and TOML are
+parsed before storage. Content rejected by the existing secret-redaction boundary is not stored.
+The store enforces per-blob and total-size quotas, validates logical names, and rejects symlink,
+junction, and other reparse-point components below its trusted root. Binary artifacts and
+media-specific sanitizers are deliberately deferred.
 
 ## Evidence journal
 
@@ -59,7 +64,8 @@ An episode is a selected, reproducible description of one attempt. It requires:
 
 - existing trace and evidence provenance from the same task/attempt;
 - a content hash calculated after redaction;
-- an environment fingerprint;
+- at least one environment fingerprint; when the source attempt is persisted, its fingerprint
+  must be included;
 - an explicit retention policy;
 - a non-empty summary while payload is active.
 
@@ -84,6 +90,9 @@ content hash, provenance, applicability, retention, and creation time. An artifa
 claim with evidence, not a database row that is automatically true.
 
 `Provenance` links source trace events, verifier evidence, verification reports, and parent artifacts.
+When report provenance is declared, its IDs must resolve to the source attempt and referenced
+evidence must belong to that report; parent episode IDs must already exist. A general artifact
+registry is still deferred, so this increment validates persisted episode parents only.
 `Applicability` describes family, structured scope, compatible environments, preconditions,
 exclusions, and required capabilities. An empty environment set means «not yet constrained by
 an environment fingerprint», not «compatible with every future environment».
