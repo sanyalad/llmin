@@ -8,6 +8,10 @@ LLMIN — экспериментальная автономная агентна
 
 ## Основные документы
 
+- [Architect Handbook](docs/architecture.md): [компоненты](docs/components.md),
+  [понятия](docs/concepts.md), [глоссарий](docs/glossary.md),
+  [решения](docs/decisions.md), [roadmap](docs/roadmap.md),
+  [эксперименты](docs/experiments.md)
 - [Манифест](docs/manifesto.md)
 - [Подробный план первого этапа](docs/stage-1-plan.md)
 - [ADR-0001: первый вертикальный срез](docs/adr/0001-terminal-vertical-slice.md)
