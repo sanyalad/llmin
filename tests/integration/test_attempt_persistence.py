@@ -1,6 +1,7 @@
 import hashlib
 import shutil
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 from uuid import uuid4
 
@@ -12,6 +13,7 @@ from llmin.domain.json_types import canonical_json
 from llmin.execution import CapabilityRegistry, Executor, SandboxFactory
 from llmin.memory import (
     ArtifactStoreError,
+    AttemptCoordinator,
     AttemptRecorder,
     AttemptStatus,
     ContentAddressedArtifactStore,
@@ -66,6 +68,7 @@ def test_recorder_reconstructs_complete_verified_attempt(tmp_path: Path) -> None
     memory = SQLiteMemoryStore(tmp_path / "memory.sqlite3")
     artifacts = ContentAddressedArtifactStore(tmp_path / "artifacts")
     task, workspace, result = run_fixture(tmp_path, memory)
+    result = replace(result, final_state=TaskState.COMPLETED)
     recorder = AttemptRecorder(memory=memory, artifacts=artifacts)
     output = (workspace / "config.toml").read_bytes()
 
@@ -189,6 +192,7 @@ def test_rejected_artifact_leaves_retryable_open_attempt(tmp_path: Path) -> None
     memory = SQLiteMemoryStore(tmp_path / "memory.sqlite3")
     artifacts = ContentAddressedArtifactStore(tmp_path / "artifacts")
     task, _workspace, result = run_fixture(tmp_path, memory)
+    result = replace(result, final_state=TaskState.COMPLETED)
     recorder = AttemptRecorder(memory=memory, artifacts=artifacts)
 
     with pytest.raises(ArtifactStoreError, match="requiring redaction"):
@@ -227,6 +231,137 @@ def test_begin_attempt_is_idempotent_without_explicit_timestamp(tmp_path: Path) 
     )
 
     assert first == second
+
+
+def test_coordinator_opens_attempt_before_planning_and_closes_identity_chain(
+    tmp_path: Path,
+) -> None:
+    memory = SQLiteMemoryStore(tmp_path / "memory.sqlite3")
+    artifacts = ContentAddressedArtifactStore(tmp_path / "artifacts")
+    task, plan, workspace = load_fixture(tmp_path)
+    attempt_id = uuid4()
+    trace_id = uuid4()
+
+    class InspectingPlanner:
+        def plan(self, received_task: TaskSpec) -> ExecutionPlan:
+            stored = memory.get_attempt(attempt_id)
+            assert stored is not None
+            assert stored.status is AttemptStatus.OPEN
+            assert stored.task == received_task
+            assert stored.trace_id == trace_id
+            assert stored.plan is None
+            return plan
+
+    factory = SandboxFactory(tmp_path)
+    pipeline = Pipeline(
+        planner=InspectingPlanner(),
+        executor=Executor(
+            CapabilityRegistry.with_builtins(), sandbox_factory=factory, trace_sink=memory
+        ),
+        verification=VerificationService(
+            VerifierRegistry.with_builtins(), sandbox_factory=factory, trace_sink=memory
+        ),
+        trace_sink=memory,
+    )
+
+    coordinated = AttemptCoordinator(memory=memory, artifacts=artifacts).run(
+        pipeline=pipeline,
+        task=task,
+        environment_attributes={"os": "test"},
+        artifact_payloads={
+            "config.toml": ((workspace / "config.toml").read_bytes(), "application/toml")
+        },
+        trace_id=trace_id,
+        attempt_id=attempt_id,
+    )
+
+    assert coordinated.result.attempt_id == attempt_id
+    assert coordinated.record.status is AttemptStatus.FINALIZED
+    assert coordinated.record.plan == plan
+    journal = memory.reconstruct_attempt(attempt_id)
+    assert journal.trace_events
+    assert all(event.task_id == task.task_id for event in journal.trace_events)
+    assert all(event.trace_id == trace_id for event in journal.trace_events)
+    assert all(event.attempt_id == attempt_id for event in journal.trace_events)
+
+
+def test_coordinator_leaves_open_attempt_when_pipeline_crashes(tmp_path: Path) -> None:
+    memory = SQLiteMemoryStore(tmp_path / "memory.sqlite3")
+    artifacts = ContentAddressedArtifactStore(tmp_path / "artifacts")
+    task, plan, _workspace = load_fixture(tmp_path)
+    attempt_id = uuid4()
+
+    class FailingTraceSink:
+        def emit(self, _event: object) -> None:
+            raise RuntimeError("simulated trace sink failure")
+
+    factory = SandboxFactory(tmp_path)
+    pipeline = Pipeline(
+        planner=FakePlanner(lambda _task: plan),
+        executor=Executor(
+            CapabilityRegistry.with_builtins(),
+            sandbox_factory=factory,
+            trace_sink=FailingTraceSink(),
+        ),
+        verification=VerificationService(
+            VerifierRegistry.with_builtins(), sandbox_factory=factory, trace_sink=FailingTraceSink()
+        ),
+        trace_sink=FailingTraceSink(),
+    )
+
+    with pytest.raises(RuntimeError, match="trace sink failure"):
+        AttemptCoordinator(memory=memory, artifacts=artifacts).run(
+            pipeline=pipeline,
+            task=task,
+            environment_attributes={"os": "test"},
+            attempt_id=attempt_id,
+        )
+
+    stored = memory.get_attempt(attempt_id)
+    assert stored is not None
+    assert stored.status is AttemptStatus.OPEN
+    assert stored.plan is None
+
+
+def test_persistence_failure_never_emits_recorded_or_completed(tmp_path: Path) -> None:
+    memory = SQLiteMemoryStore(tmp_path / "memory.sqlite3")
+    artifacts = ContentAddressedArtifactStore(tmp_path / "artifacts")
+    task, plan, _workspace = load_fixture(tmp_path)
+    attempt_id = uuid4()
+    factory = SandboxFactory(tmp_path)
+    pipeline = Pipeline(
+        planner=FakePlanner(lambda _task: plan),
+        executor=Executor(
+            CapabilityRegistry.with_builtins(), sandbox_factory=factory, trace_sink=memory
+        ),
+        verification=VerificationService(
+            VerifierRegistry.with_builtins(), sandbox_factory=factory, trace_sink=memory
+        ),
+        trace_sink=memory,
+    )
+
+    with pytest.raises(ArtifactStoreError, match="requiring redaction"):
+        AttemptCoordinator(memory=memory, artifacts=artifacts).run(
+            pipeline=pipeline,
+            task=task,
+            environment_attributes={"os": "test"},
+            artifact_payloads={
+                "unsafe.txt": (b"password=do-not-store\n", "text/plain"),
+            },
+            attempt_id=attempt_id,
+        )
+
+    stored = memory.get_attempt(attempt_id)
+    assert stored is not None
+    assert stored.status is AttemptStatus.OPEN
+    transitions = [
+        event.payload["to_state"]
+        for event in memory.reconstruct_attempt(attempt_id).trace_events
+        if event.event_type == "orchestrator.transition"
+    ]
+    assert transitions[-1] == TaskState.VERIFIED.value
+    assert TaskState.RECORDED.value not in transitions
+    assert TaskState.COMPLETED.value not in transitions
 
 
 def test_recorder_rejects_result_for_another_task(tmp_path: Path) -> None:

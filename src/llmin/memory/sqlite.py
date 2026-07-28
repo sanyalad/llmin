@@ -138,7 +138,7 @@ class SQLiteMemoryStore:
         attempt_id: UUID,
         trace_id: UUID,
         task: TaskSpec,
-        plan: ExecutionPlan | None,
+        plan: ExecutionPlan | None = None,
         environment: EnvironmentRecord,
         created_at: datetime | None = None,
     ) -> AttemptRecord:
@@ -180,6 +180,7 @@ class SQLiteMemoryStore:
         self,
         attempt_id: UUID,
         *,
+        plan: ExecutionPlan | None = None,
         final_state: TaskState,
         execution_report: ExecutionReport | None,
         verification_report: VerificationReport | None,
@@ -196,6 +197,8 @@ class SQLiteMemoryStore:
             if row is None:
                 raise MemoryStoreError("attempt does not exist")
             current = AttemptRecord.model_validate_json(row[0])
+            if current.plan is not None and plan is not None and current.plan != plan:
+                raise MemoryStoreError("attempt plan was changed during finalization")
             effective_finalized_at = (
                 current.finalized_at if current.status is AttemptStatus.FINALIZED else timestamp
             )
@@ -204,6 +207,7 @@ class SQLiteMemoryStore:
                     current.model_copy(
                         update={
                             "status": AttemptStatus.FINALIZED,
+                            "plan": current.plan or plan,
                             "final_state": final_state,
                             "execution_report": execution_report,
                             "verification_report": verification_report,

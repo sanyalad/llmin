@@ -21,6 +21,7 @@ LLMIN — экспериментальная автономная агентна
 - [Независимая верификация](docs/verification.md)
 - [Stage 1 benchmark](docs/benchmark.md)
 - [Memory v0](docs/memory.md)
+- [План улучшений после ревью Memory v0](docs/improvement-plan.md)
 - [Как участвовать в разработке](CONTRIBUTING.md)
 
 ## Коротко об архитектуре

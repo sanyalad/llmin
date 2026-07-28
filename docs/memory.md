@@ -19,10 +19,17 @@ an `AttemptRecord` containing:
 
 Recording has two explicit phases. `begin_attempt()` creates an `open` record, and
 `finalize_attempt()` atomically commits terminal metadata and verifier evidence in one SQLite
-transaction. Repeating either operation with identical content is idempotent, including direct
-`begin_attempt()` retries that do not supply a timestamp. Reusing an identifier for different
-content is rejected. SQLite identity comparisons use a canonical JSON encoding that sorts only
-unordered set-like fields; declared list and tuple order remains meaningful.
+transaction. `AttemptCoordinator` is the normal pre-run boundary: it creates the open record,
+passes its fixed `trace_id` and `attempt_id` to `Pipeline`, then finalizes that same record. A
+successful direct `Pipeline.run()` stops at `verified`; only a successful coordinator recording
+gate permits the `recorded` and `completed` transitions. Failed persistence therefore leaves the
+attempt open and cannot publish a false terminal success. A
+crash before a `PipelineResult` leaves the open record for diagnosis instead of creating a
+trace-only execution. Repeating either persistence operation with identical content is
+idempotent, including direct `begin_attempt()` retries that do not supply a timestamp. Reusing
+an identifier for different content is rejected. SQLite identity comparisons use a canonical
+JSON encoding that sorts only unordered set-like fields; declared list and tuple order remains
+meaningful.
 
 An attempt marked `completed` is valid only when execution succeeded and independent
 verification passed. Cross-task, cross-plan, and cross-attempt report references are rejected
@@ -111,17 +118,18 @@ automatic experiment generation and routing are deferred.
 
 ## Recovery boundary
 
-The current recorder makes finalized attempt metadata internally atomic, but it is not yet a
-pre-run transaction coordinator:
+The coordinator makes finalized attempt metadata internally atomic and creates the attempt
+before a coordinated pipeline run. It is still not a complete recovery system:
 
-- trace events may be persisted before the corresponding attempt row is created;
-- a process crash before `AttemptRecorder.record()` may leave trace-only evidence;
+- callers can invoke `Pipeline.run()` directly, but such a run stops at `verified` and is not a
+  durably completed attempt;
+- an operating-system crash can still interrupt an open attempt and requires reconciliation;
 - a failed database finalization may leave an unreferenced immutable CAS blob;
 - garbage collection and reconciliation of trace-only attempts or unreferenced blobs are not
   implemented yet.
 
-The next recovery increment should create the open attempt before pipeline execution, add
-startup reconciliation, and introduce conservative reference-based garbage collection.
+The next recovery increment should add startup reconciliation and conservative reference-based
+garbage collection.
 
 ## Explicit non-goals
 

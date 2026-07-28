@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from uuid import UUID
 
@@ -38,8 +39,22 @@ class Pipeline:
         self._verification = verification
         self._trace_sink = trace_sink
 
-    def run(self, task: TaskSpec) -> PipelineResult:
-        run = OrchestratorRun(task_id=task.task_id, trace_sink=self._trace_sink)
+    def run(
+        self,
+        task: TaskSpec,
+        *,
+        trace_id: UUID | None = None,
+        attempt_id: UUID | None = None,
+        completion_gate: Callable[[PipelineResult], None] | None = None,
+    ) -> PipelineResult:
+        """Execute and verify a task, completing only after an external recording gate."""
+
+        run = OrchestratorRun(
+            task_id=task.task_id,
+            trace_sink=self._trace_sink,
+            trace_id=trace_id,
+            attempt_id=attempt_id,
+        )
         run.transition(TaskState.ROUTED, reason="task accepted for routing")
         try:
             plan = self._planner.plan(task)
@@ -110,9 +125,7 @@ class Pipeline:
             )
 
         run.transition(TaskState.VERIFIED, reason="independent verifier passed")
-        run.transition(TaskState.RECORDED, reason="trace and evidence emitted")
-        run.transition(TaskState.COMPLETED, reason="task reached a verified terminal state")
-        return PipelineResult(
+        verified_result = PipelineResult(
             task.task_id,
             run.trace_id,
             run.attempt_id,
@@ -121,3 +134,19 @@ class Pipeline:
             execution,
             verification,
         )
+        if completion_gate is None:
+            return verified_result
+
+        completed_result = PipelineResult(
+            task.task_id,
+            run.trace_id,
+            run.attempt_id,
+            TaskState.COMPLETED,
+            plan,
+            execution,
+            verification,
+        )
+        completion_gate(completed_result)
+        run.transition(TaskState.RECORDED, reason="trace and evidence emitted")
+        run.transition(TaskState.COMPLETED, reason="task reached a verified terminal state")
+        return completed_result

@@ -31,7 +31,7 @@ from llmin.memory.models import (
     environment_content_hash,
     episode_content_hash,
 )
-from llmin.memory.recorder import AttemptRecorder
+from llmin.memory.recorder import AttemptCoordinator, AttemptRecorder, CoordinatedAttempt
 from llmin.memory.sqlite import MemoryStoreError, SQLiteMemoryStore
 
 __all__ = [
@@ -42,6 +42,7 @@ __all__ = [
     "ArtifactRelation",
     "ArtifactStoreError",
     "ArtifactVerifierResult",
+    "AttemptCoordinator",
     "AttemptMemory",
     "AttemptRecord",
     "AttemptRecorder",
@@ -49,6 +50,7 @@ __all__ = [
     "ContentAddressedArtifactStore",
     "ContradictionRecord",
     "ContradictionStatus",
+    "CoordinatedAttempt",
     "CostCategory",
     "CostEntry",
     "EnvironmentRecord",

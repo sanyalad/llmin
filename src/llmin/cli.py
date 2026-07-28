@@ -14,7 +14,11 @@ from llmin import __version__
 from llmin.benchmark import BenchmarkRunner, BenchmarkSplit, BenchmarkSuite
 from llmin.domain import ExecutionPlan, TaskSpec
 from llmin.execution import CapabilityRegistry, Executor, SandboxFactory
-from llmin.observability import InMemoryTraceSink
+from llmin.memory import (
+    AttemptCoordinator,
+    ContentAddressedArtifactStore,
+    SQLiteMemoryStore,
+)
 from llmin.orchestrator import TaskState
 from llmin.pipeline import Pipeline
 from llmin.planning import FakePlanner
@@ -73,7 +77,10 @@ def run_fixture(
         typer.echo(f"invalid fixture: {error}", err=True)
         raise typer.Exit(code=2) from error
 
-    sink = InMemoryTraceSink()
+    memory_root = base_root / ".llmin"
+    memory_root.mkdir(exist_ok=True)
+    sink = SQLiteMemoryStore(memory_root / "memory.sqlite3")
+    artifacts = ContentAddressedArtifactStore(memory_root / "artifacts")
     sandbox_factory = SandboxFactory(base_root)
     executor = Executor(
         CapabilityRegistry.with_builtins(),
@@ -91,7 +98,19 @@ def run_fixture(
         verification=verification,
         trace_sink=sink,
     )
-    result = pipeline.run(task)
+    result = (
+        AttemptCoordinator(memory=sink, artifacts=artifacts)
+        .run(
+            pipeline=pipeline,
+            task=task,
+            environment_attributes={
+                "command": "run-fixture",
+                "base_root": str(base_root.resolve()),
+            },
+        )
+        .result
+    )
+    events = sink.reconstruct_attempt(result.attempt_id).trace_events
     summary = {
         "task_id": str(task.task_id),
         "final_state": result.final_state.value,
@@ -103,7 +122,7 @@ def run_fixture(
             if result.verification_report is not None
             else None
         ),
-        "trace_events": len(sink.events),
+        "trace_events": len(events),
     }
     typer.echo(json.dumps(summary, ensure_ascii=False, sort_keys=True))
     if result.final_state is not TaskState.COMPLETED:

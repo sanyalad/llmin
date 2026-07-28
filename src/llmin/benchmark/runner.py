@@ -33,7 +33,11 @@ from llmin.domain import (
     VerificationVerdict,
 )
 from llmin.execution import CapabilityRegistry, Executor, SandboxFactory
-from llmin.observability import InMemoryTraceSink
+from llmin.memory import (
+    AttemptCoordinator,
+    ContentAddressedArtifactStore,
+    SQLiteMemoryStore,
+)
 from llmin.orchestrator import TaskState
 from llmin.pipeline import Pipeline
 from llmin.planning import FakePlanner
@@ -166,7 +170,10 @@ class BenchmarkRunner:
                 newline="\n",
             )
 
-        sink = InMemoryTraceSink()
+        memory_root = run_root / ".llmin" / case.case_id
+        memory_root.mkdir(parents=True, exist_ok=False)
+        sink = SQLiteMemoryStore(memory_root / "memory.sqlite3")
+        artifacts = ContentAddressedArtifactStore(memory_root / "artifacts")
         sandbox_factory = SandboxFactory(run_root)
         executor = Executor(
             CapabilityRegistry.with_builtins(),
@@ -185,8 +192,18 @@ class BenchmarkRunner:
             trace_sink=sink,
         )
         started = perf_counter()
-        result = pipeline.run(task)
+        coordinated = AttemptCoordinator(memory=sink, artifacts=artifacts).run(
+            pipeline=pipeline,
+            task=task,
+            environment_attributes={
+                "benchmark_suite": suite.name,
+                "case_id": case.case_id,
+                "family": task.family,
+            },
+        )
+        result = coordinated.result
         elapsed_ms = (perf_counter() - started) * 1_000
+        events = sink.reconstruct_attempt(result.attempt_id).trace_events
         execution_success = (
             result.execution_report.success if result.execution_report is not None else None
         )
@@ -216,7 +233,7 @@ class BenchmarkRunner:
         changes = result.execution_report.changes if result.execution_report is not None else ()
         terminal_reason = next(
             str(event.payload["reason"])
-            for event in reversed(sink.events)
+            for event in reversed(events)
             if event.event_type == "orchestrator.transition"
             and event.payload.get("to_state") == result.final_state.value
         )
@@ -241,11 +258,11 @@ class BenchmarkRunner:
             verification_errors=verification_errors,
             evidence_sha256=evidence_sha256,
             changes=changes,
-            trace_event_types=tuple(event.event_type for event in sink.events),
+            trace_event_types=tuple(event.event_type for event in events),
             matched_expectation=matched,
             mutation_expected_rejection=case.mutation_expected_rejection,
             unsafe_acceptance=unsafe_acceptance,
-            trace_events=len(sink.events),
+            trace_events=len(events),
             elapsed_ms=elapsed_ms,
         )
 
