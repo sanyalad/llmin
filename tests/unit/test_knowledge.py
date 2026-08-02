@@ -15,7 +15,9 @@ from llmin.domain import (
 from llmin.knowledge import (
     CompiledSkill,
     ExactMatchKnowledgeRouter,
+    RouteDecision,
     RouteOutcome,
+    RoutingPlanner,
     task_signature,
 )
 from llmin.memory import (
@@ -24,6 +26,7 @@ from llmin.memory import (
     Provenance,
     RetentionPolicy,
 )
+from llmin.planning import FakePlanner
 
 ENVIRONMENT = "a" * 64
 
@@ -92,6 +95,19 @@ def make_skill(
         source_task_id=task.task_id,
         source_attempt_id=attempt_id,
         source_verification_report_id=report_id,
+    )
+
+
+def make_fallback_plan(task: TaskSpec) -> ExecutionPlan:
+    return ExecutionPlan(
+        task_id=task.task_id,
+        planner_kind=PlannerKind.LLM,
+        actions=(
+            Action(
+                capability="write_file",
+                arguments={"path": "app.json", "content": "fallback"},
+            ),
+        ),
     )
 
 
@@ -179,4 +195,76 @@ def test_semantic_mutation_is_rejected() -> None:
     )
 
     assert decision.outcome is RouteOutcome.REJECTED
+    assert decision.llm_calls == 1
+
+
+def test_routing_planner_hit_does_not_call_fallback() -> None:
+    source = make_task()
+    repeated = make_task()
+    fallback_calls = 0
+
+    def fallback_factory(task: TaskSpec) -> ExecutionPlan:
+        nonlocal fallback_calls
+        fallback_calls += 1
+        return make_fallback_plan(task)
+
+    planner = RoutingPlanner(
+        router=ExactMatchKnowledgeRouter(),
+        fallback=FakePlanner(fallback_factory),
+        skill_provider=lambda: (make_skill(source),),
+        environment_fingerprint=lambda task: ENVIRONMENT,
+    )
+
+    plan = planner.plan(repeated)
+
+    assert plan.planner_kind is PlannerKind.COMPILED
+    assert plan.task_id == repeated.task_id
+    assert fallback_calls == 0
+    assert planner.last_decision is not None
+    assert planner.last_decision.llm_calls == 0
+
+
+def test_routing_planner_miss_calls_fallback_once() -> None:
+    task = make_task()
+    fallback_calls = 0
+
+    def fallback_factory(current: TaskSpec) -> ExecutionPlan:
+        nonlocal fallback_calls
+        fallback_calls += 1
+        return make_fallback_plan(current)
+
+    planner = RoutingPlanner(
+        router=ExactMatchKnowledgeRouter(),
+        fallback=FakePlanner(fallback_factory),
+        skill_provider=tuple,
+        environment_fingerprint=lambda current: ENVIRONMENT,
+    )
+
+    plan = planner.plan(task)
+
+    assert plan.planner_kind is PlannerKind.LLM
+    assert fallback_calls == 1
+    assert planner.last_decision is not None
+    assert planner.last_decision.outcome is RouteOutcome.MISS
+    assert planner.last_decision.llm_calls == 1
+
+
+def test_routing_planner_emits_decision_before_fallback() -> None:
+    task = make_task()
+    observed: list[tuple[TaskSpec, RouteDecision]] = []
+
+    planner = RoutingPlanner(
+        router=ExactMatchKnowledgeRouter(),
+        fallback=FakePlanner(make_fallback_plan),
+        skill_provider=tuple,
+        environment_fingerprint=lambda current: ENVIRONMENT,
+        decision_sink=lambda current, decision: observed.append((current, decision)),
+    )
+
+    planner.plan(task)
+
+    assert len(observed) == 1
+    observed_task, decision = observed[0]
+    assert observed_task is task
+    assert decision.outcome is RouteOutcome.MISS
     assert decision.llm_calls == 1
