@@ -77,6 +77,8 @@ def test_openrouter_planner_builds_local_plan_from_strict_actions() -> None:
     request = transport.requests[0]
     assert request["response_format"]["json_schema"]["strict"] is True
     assert request["provider"] == {"require_parameters": True}
+    assert request["max_tokens"] == 1_000
+    assert "max_completion_tokens" not in request
     assert request["stream"] is False
 
 

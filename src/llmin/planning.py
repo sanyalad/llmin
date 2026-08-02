@@ -190,7 +190,7 @@ class OpenRouterPlanner:
             },
             "provider": {"require_parameters": True},
             "temperature": 0,
-            "max_completion_tokens": self._max_completion_tokens,
+            "max_tokens": self._max_completion_tokens,
             "stream": False,
         }
 
