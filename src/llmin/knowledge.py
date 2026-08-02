@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Callable
 from enum import StrEnum
 from typing import Literal
 from uuid import UUID
@@ -12,6 +13,7 @@ from pydantic import Field, model_validator
 
 from llmin.domain import ContractModel, ExecutionPlan, PlannerKind, TaskSpec
 from llmin.memory import ActivationState, Applicability, MemoryArtifact, MemoryLayer
+from llmin.planning import Planner
 
 
 def task_signature(task: TaskSpec) -> str:
@@ -162,3 +164,40 @@ class ExactMatchKnowledgeRouter:
         if applicability.exclusions:
             return "skill has unresolved exclusions"
         return None
+
+
+class RoutingPlanner:
+    """Prefer exact compiled knowledge and otherwise delegate to a bounded planner."""
+
+    def __init__(
+        self,
+        *,
+        router: ExactMatchKnowledgeRouter,
+        fallback: Planner,
+        skill_provider: Callable[[], tuple[CompiledSkill, ...]],
+        environment_fingerprint: Callable[[TaskSpec], str],
+        decision_sink: Callable[[TaskSpec, RouteDecision], None] | None = None,
+    ) -> None:
+        self._router = router
+        self._fallback = fallback
+        self._skill_provider = skill_provider
+        self._environment_fingerprint = environment_fingerprint
+        self._decision_sink = decision_sink
+        self._last_decision: RouteDecision | None = None
+
+    @property
+    def last_decision(self) -> RouteDecision | None:
+        return self._last_decision
+
+    def plan(self, task: TaskSpec) -> ExecutionPlan:
+        decision = self._router.route(
+            task=task,
+            environment_fingerprint=self._environment_fingerprint(task),
+            skills=self._skill_provider(),
+        )
+        self._last_decision = decision
+        if self._decision_sink is not None:
+            self._decision_sink(task, decision)
+        if decision.plan is not None:
+            return decision.plan
+        return self._fallback.plan(task)
