@@ -6,7 +6,9 @@ from uuid import UUID, uuid4
 from typer.testing import CliRunner
 
 from llmin.cli import app
+from llmin.domain import Action, ExecutionPlan, PlannerKind, TaskSpec
 from llmin.memory import SQLiteMemoryStore
+from llmin.planning import OpenRouterPlanner
 
 runner = CliRunner()
 
@@ -122,6 +124,56 @@ def test_show_attempt_reports_unknown_id(tmp_path: Path) -> None:
 
     assert result.exit_code == 1
     assert "attempt not found:" in result.stderr
+
+
+def test_run_agent_uses_llm_plan_then_executes_verifies_and_persists(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    task_file = Path("benchmarks/tasks/config_patch/001.json")
+    task = TaskSpec.model_validate_json(task_file.read_text(encoding="utf-8"))
+    workspace = tmp_path / task.workspace
+    workspace.parent.mkdir(parents=True)
+    shutil.copytree(Path("benchmarks/workspaces/config-patch-001"), workspace)
+    plan = ExecutionPlan(
+        task_id=task.task_id,
+        planner_kind=PlannerKind.LLM,
+        actions=(
+            Action(
+                capability="patch_toml",
+                arguments={"path": "config.toml", "key": "service.timeout", "value": 30},
+            ),
+        ),
+        estimated_cost_usd="0.001",
+    )
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-secret")
+    monkeypatch.setattr(OpenRouterPlanner, "plan", lambda self, _task: plan)
+
+    result = runner.invoke(
+        app,
+        ["run-agent", str(task_file), str(tmp_path), "--model", "test/model"],
+    )
+
+    assert result.exit_code == 0
+    summary = json.loads(result.stdout)
+    assert summary["final_state"] == "completed"
+    assert summary["planner_kind"] == "llm"
+    assert summary["estimated_cost_usd"] == "0.001"
+    assert summary["execution_success"] is True
+    assert summary["verification_verdict"] == "passed"
+    attempt = SQLiteMemoryStore(tmp_path / ".llmin" / "memory.sqlite3").get_attempt(
+        UUID(summary["attempt_id"])
+    )
+    assert attempt is not None
+    assert attempt.plan is not None and attempt.plan.planner_kind is PlannerKind.LLM
+    assert "timeout = 30" in (workspace / "config.toml").read_text(encoding="utf-8")
+    persisted = runner.invoke(
+        app,
+        ["show-attempt", str(tmp_path / ".llmin" / "memory.sqlite3"), summary["attempt_id"]],
+    )
+    persisted_summary = json.loads(persisted.stdout)
+    assert persisted_summary["planner_provider"] == "openrouter"
+    assert persisted_summary["planner_model"] == "test/model"
 
 
 def test_benchmark_command_writes_passing_report(tmp_path: Path) -> None:
