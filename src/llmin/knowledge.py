@@ -5,21 +5,26 @@ from __future__ import annotations
 import hashlib
 import json
 from enum import StrEnum
-from typing import Any, Literal
-from uuid import UUID, uuid4
+from typing import Literal
+from uuid import UUID
 
 from pydantic import Field, model_validator
 
 from llmin.domain import ContractModel, ExecutionPlan, PlannerKind, TaskSpec
-from llmin.memory import ActivationState, Applicability, MemoryArtifact, MemoryLayer
+from llmin.memory import (
+    ActivationState,
+    Applicability,
+    ArtifactKind,
+    MemoryArtifact,
+    MemoryLayer,
+)
 
 
 def task_signature(task: TaskSpec) -> str:
     """Return a stable exact-match signature for reusable task semantics.
 
-    Volatile identity fields and budgets are intentionally excluded. The signature
-    covers the task family, objective, workspace, inputs, constraints and
-    postconditions. Any semantic change therefore produces a miss.
+    Volatile identity fields, creation time and budgets are intentionally excluded.
+    Any change to the requested work, constraints or required outcome produces a miss.
     """
 
     payload = {
@@ -46,11 +51,12 @@ def task_signature(task: TaskSpec) -> str:
 class CompiledSkill(MemoryArtifact):
     """A previously verified execution plan eligible for exact-match reuse."""
 
-    kind: Literal["compiled_skill"] = "compiled_skill"
+    kind: Literal[ArtifactKind.COMPILED_SKILL] = ArtifactKind.COMPILED_SKILL
     layer: Literal[MemoryLayer.PROCEDURAL] = MemoryLayer.PROCEDURAL
     activation_state: ActivationState = ActivationState.CANDIDATE
     task_signature: str = Field(pattern=r"^[0-9a-f]{64}$")
     plan: ExecutionPlan
+    source_task_id: UUID
     source_attempt_id: UUID
     source_verification_report_id: UUID
 
@@ -60,10 +66,8 @@ class CompiledSkill(MemoryArtifact):
             raise ValueError("compiled skills must contain a compiled execution plan")
         if self.plan.knowledge_artifact_id != self.artifact_id:
             raise ValueError("compiled plan must reference its owning skill")
-        if self.plan.task_id != self.source_attempt_id:
-            # A compiled plan is rebound to the incoming task at route time. At rest,
-            # task_id stores the source attempt identity to prevent accidental reuse.
-            raise ValueError("stored compiled plan must be bound to the source attempt")
+        if self.plan.task_id != self.source_task_id:
+            raise ValueError("stored compiled plan must remain bound to its source task")
         if self.source_verification_report_id not in self.provenance.verification_report_ids:
             raise ValueError("source verification report must be present in provenance")
         return self
@@ -116,13 +120,12 @@ class ExactMatchKnowledgeRouter:
             )
 
         for skill in family_skills:
-            rejection = self._rejection_reason(
+            if self._rejection_reason(
                 task=task,
                 environment_fingerprint=environment_fingerprint,
                 signature=signature,
                 skill=skill,
-            )
-            if rejection is not None:
+            ) is not None:
                 continue
             rebound = skill.plan.model_copy(update={"task_id": task.task_id})
             return RouteDecision(
