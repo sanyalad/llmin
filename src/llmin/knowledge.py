@@ -157,9 +157,7 @@ class ExactMatchKnowledgeRouter:
         applicability: Applicability = skill.applicability
         if environment_fingerprint not in applicability.environment_fingerprints:
             return "environment mismatch"
-        if not applicability.required_capabilities.issubset(
-            task.constraints.allowed_capabilities
-        ):
+        if not applicability.required_capabilities.issubset(task.constraints.allowed_capabilities):
             return "required capability unavailable"
         if applicability.exclusions:
             return "skill has unresolved exclusions"
