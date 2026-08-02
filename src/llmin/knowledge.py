@@ -5,26 +5,21 @@ from __future__ import annotations
 import hashlib
 import json
 from enum import StrEnum
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import Field, model_validator
 
 from llmin.domain import ContractModel, ExecutionPlan, PlannerKind, TaskSpec
-from llmin.memory import (
-    ActivationState,
-    Applicability,
-    ArtifactKind,
-    MemoryArtifact,
-    MemoryLayer,
-)
+from llmin.memory import ActivationState, Applicability, MemoryArtifact, MemoryLayer
 
 
 def task_signature(task: TaskSpec) -> str:
     """Return a stable exact-match signature for reusable task semantics.
 
-    Volatile identity fields, creation time and budgets are intentionally excluded.
-    Any change to the requested work, constraints or required outcome produces a miss.
+    Volatile identity fields and budgets are intentionally excluded. The signature
+    covers the task family, objective, workspace, inputs, constraints and
+    postconditions. Any semantic change therefore produces a miss.
     """
 
     payload = {
@@ -38,9 +33,9 @@ def task_signature(task: TaskSpec) -> str:
     }
     encoded = json.dumps(
         payload,
-        default=lambda value: value.model_dump(mode="json")
-        if hasattr(value, "model_dump")
-        else str(value),
+        default=lambda value: (
+            value.model_dump(mode="json") if hasattr(value, "model_dump") else str(value)
+        ),
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -51,7 +46,7 @@ def task_signature(task: TaskSpec) -> str:
 class CompiledSkill(MemoryArtifact):
     """A previously verified execution plan eligible for exact-match reuse."""
 
-    kind: Literal[ArtifactKind.COMPILED_SKILL] = ArtifactKind.COMPILED_SKILL
+    kind: Literal["compiled_skill"] = "compiled_skill"
     layer: Literal[MemoryLayer.PROCEDURAL] = MemoryLayer.PROCEDURAL
     activation_state: ActivationState = ActivationState.CANDIDATE
     task_signature: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -61,13 +56,13 @@ class CompiledSkill(MemoryArtifact):
     source_verification_report_id: UUID
 
     @model_validator(mode="after")
-    def validate_compiled_plan(self) -> "CompiledSkill":
+    def validate_compiled_plan(self) -> CompiledSkill:
         if self.plan.planner_kind is not PlannerKind.COMPILED:
             raise ValueError("compiled skills must contain a compiled execution plan")
         if self.plan.knowledge_artifact_id != self.artifact_id:
             raise ValueError("compiled plan must reference its owning skill")
         if self.plan.task_id != self.source_task_id:
-            raise ValueError("stored compiled plan must remain bound to its source task")
+            raise ValueError("stored compiled plan must be bound to the source task")
         if self.source_verification_report_id not in self.provenance.verification_report_ids:
             raise ValueError("source verification report must be present in provenance")
         return self
@@ -88,7 +83,7 @@ class RouteDecision(ContractModel):
     llm_calls: int = Field(ge=0, le=1)
 
     @model_validator(mode="after")
-    def validate_shape(self) -> "RouteDecision":
+    def validate_shape(self) -> RouteDecision:
         if self.outcome is RouteOutcome.HIT:
             if self.skill_id is None or self.plan is None or self.llm_calls != 0:
                 raise ValueError("route hits require skill, plan and zero LLM calls")
@@ -110,7 +105,9 @@ class ExactMatchKnowledgeRouter:
         skills: tuple[CompiledSkill, ...],
     ) -> RouteDecision:
         signature = task_signature(task)
-        family_skills = tuple(skill for skill in skills if skill.applicability.family == task.family)
+        family_skills = tuple(
+            skill for skill in skills if skill.applicability.family == task.family
+        )
         if not family_skills:
             return RouteDecision(
                 outcome=RouteOutcome.MISS,
@@ -120,12 +117,13 @@ class ExactMatchKnowledgeRouter:
             )
 
         for skill in family_skills:
-            if self._rejection_reason(
+            rejection = self._rejection_reason(
                 task=task,
                 environment_fingerprint=environment_fingerprint,
                 signature=signature,
                 skill=skill,
-            ) is not None:
+            )
+            if rejection is not None:
                 continue
             rebound = skill.plan.model_copy(update={"task_id": task.task_id})
             return RouteDecision(
