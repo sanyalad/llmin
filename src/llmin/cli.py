@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Annotated
 from uuid import UUID
@@ -148,7 +149,10 @@ def run_agent(
     coordinated = AttemptCoordinator(memory=sink, artifacts=artifacts).run(
         pipeline=pipeline,
         task=task,
-        environment_attributes=EnvironmentProbe().capture(),
+        environment_attributes={
+            **EnvironmentProbe().capture(),
+            "planner": {"provider": "openrouter", "model": planner.model},
+        },
     )
     result = coordinated.result
     plan = result.execution_plan
@@ -265,6 +269,12 @@ def show_attempt(
     memory = sink.reconstruct_attempt(attempt_id)
     execution = attempt.execution_report
     verification = attempt.verification_report
+    planner_environment = attempt.environment.attributes.get("planner")
+    planner_provider = None
+    planner_model = None
+    if isinstance(planner_environment, Mapping):
+        planner_provider = planner_environment.get("provider")
+        planner_model = planner_environment.get("model")
     state_sequence = ["received"]
     state_sequence.extend(
         str(event.payload["to_state"])
@@ -291,6 +301,8 @@ def show_attempt(
         "status": attempt.status.value,
         "final_state": attempt.final_state.value if attempt.final_state is not None else None,
         "planner_kind": attempt.plan.planner_kind.value if attempt.plan is not None else None,
+        "planner_provider": planner_provider,
+        "planner_model": planner_model,
         "execution_success": execution.success if execution is not None else None,
         "execution_error": execution.error if execution is not None else None,
         "verification_verdict": verification.verdict.value if verification is not None else None,

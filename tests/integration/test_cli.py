@@ -167,6 +167,13 @@ def test_run_agent_uses_llm_plan_then_executes_verifies_and_persists(
     assert attempt is not None
     assert attempt.plan is not None and attempt.plan.planner_kind is PlannerKind.LLM
     assert "timeout = 30" in (workspace / "config.toml").read_text(encoding="utf-8")
+    persisted = runner.invoke(
+        app,
+        ["show-attempt", str(tmp_path / ".llmin" / "memory.sqlite3"), summary["attempt_id"]],
+    )
+    persisted_summary = json.loads(persisted.stdout)
+    assert persisted_summary["planner_provider"] == "openrouter"
+    assert persisted_summary["planner_model"] == "test/model"
 
 
 def test_benchmark_command_writes_passing_report(tmp_path: Path) -> None:

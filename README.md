@@ -100,4 +100,5 @@ llmin run-agent <task.json> <base-root>
 ```
 
 Ключ нельзя передавать аргументом команды или сохранять в Git. Поддерживающую strict structured
-outputs модель следует выбирать явно через `OPENROUTER_MODEL`.
+outputs модель следует выбирать явно через `OPENROUTER_MODEL`. Имя провайдера и модели сохраняется
+в environment-записи attempt и возвращается командой `show-attempt`.
