@@ -78,3 +78,26 @@ llmin show-attempt <base-root>\.llmin\memory.sqlite3 <attempt-id>
 ```
 
 Состояние `COMPLETED` возможно только после verifier verdict `PASSED`.
+
+## Ограниченный LLM planner
+
+OpenRouter используется только для построения типизированного `ExecutionPlan`. Модель не
+получает shell, файловый доступ или сетевые инструменты. План повторно проверяется локальными
+контрактами, policy и sandbox до любого изменения.
+
+Сначала можно получить план без исполнения:
+
+```powershell
+$env:OPENROUTER_API_KEY = "<secret>"
+$env:OPENROUTER_MODEL = "<provider/model>"
+llmin plan-task <task.json>
+```
+
+Полный путь `plan → authorize → execute → verify → persist` запускается отдельно:
+
+```powershell
+llmin run-agent <task.json> <base-root>
+```
+
+Ключ нельзя передавать аргументом команды или сохранять в Git. Поддерживающую strict structured
+outputs модель следует выбирать явно через `OPENROUTER_MODEL`.

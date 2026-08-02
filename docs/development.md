@@ -20,9 +20,22 @@ python -m venv .venv
 .\.venv\Scripts\python -m llmin.cli validate-task benchmarks\tasks\config_patch\001.json
 ```
 
-Для текущего MVP не нужны Docker, внешний сервис базы данных, `.env` или API-ключ LLM.
-SQLite-файл создаётся внутри `<base-root>\.llmin` при первом запуске. Реальный LLM adapter
-пока не реализован: `run-fixture` использует сохранённый детерминированный fake-план.
+Для детерминированного `run-fixture` не нужны Docker, внешний сервис базы данных, `.env` или
+API-ключ LLM. SQLite-файл создаётся внутри `<base-root>\.llmin` при первом запуске.
+
+Реальный агентный путь использует OpenRouter Chat Completions со strict structured outputs:
+
+```powershell
+$env:OPENROUTER_API_KEY = "<secret>"
+$env:OPENROUTER_MODEL = "<provider/model>"
+llmin plan-task <task.json>
+llmin run-agent <task.json> <base-root>
+```
+
+`plan-task` не выполняет действий. `run-agent` делает один разрешённый бюджетом LLM-вызов,
+проверяет план локально, пропускает его через capability policy и sandbox, независимо проверяет
+postconditions и сохраняет attempt. Секрет читается только из окружения; передавать его аргументом
+командной строки или коммитить `.env` запрещено.
 
 Первый инкремент намеренно не выполняет задачи. Он фиксирует строгие контракты и допустимые переходы до появления реальных побочных эффектов.
 

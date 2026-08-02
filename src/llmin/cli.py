@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 from pathlib import Path
 from typing import Annotated
@@ -23,7 +24,12 @@ from llmin.memory import (
 )
 from llmin.orchestrator import TaskState
 from llmin.pipeline import Pipeline
-from llmin.planning import FakePlanner
+from llmin.planning import (
+    FakePlanner,
+    OpenRouterPlanner,
+    PlanningError,
+    UrllibOpenRouterTransport,
+)
 from llmin.verification import VerificationService, VerifierRegistry
 
 app = typer.Typer(no_args_is_help=True, help="LLMIN Stage 1 tools")
@@ -53,6 +59,121 @@ def validate_task(
         raise typer.Exit(code=2) from error
 
     typer.echo(f"valid task_id={task.task_id} family={task.family}")
+
+
+def _load_task(task_file: Path) -> TaskSpec:
+    try:
+        return TaskSpec.model_validate_json(task_file.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValidationError) as error:
+        typer.echo(f"invalid task: {error}", err=True)
+        raise typer.Exit(code=2) from error
+
+
+def _openrouter_planner(model: str | None) -> OpenRouterPlanner:
+    api_key = os.environ.get("OPENROUTER_API_KEY", "")
+    selected_model = model or os.environ.get("OPENROUTER_MODEL", "")
+    if not api_key:
+        typer.echo("OPENROUTER_API_KEY is required", err=True)
+        raise typer.Exit(code=2)
+    if not selected_model:
+        typer.echo("--model or OPENROUTER_MODEL is required", err=True)
+        raise typer.Exit(code=2)
+    return OpenRouterPlanner(
+        model=selected_model,
+        transport=UrllibOpenRouterTransport(api_key=api_key),
+    )
+
+
+@app.command("plan-task")
+def plan_task(
+    task_file: Annotated[
+        Path,
+        typer.Argument(exists=True, file_okay=True, dir_okay=False, readable=True),
+    ],
+    model: Annotated[
+        str | None,
+        typer.Option(help="OpenRouter model slug; defaults to OPENROUTER_MODEL."),
+    ] = None,
+) -> None:
+    """Ask OpenRouter for a typed plan without executing any actions."""
+
+    task = _load_task(task_file)
+    planner = _openrouter_planner(model)
+    try:
+        plan = planner.plan(task)
+    except PlanningError as error:
+        typer.echo(f"planning failed: {error}", err=True)
+        raise typer.Exit(code=1) from error
+    typer.echo(plan.model_dump_json(indent=2))
+
+
+@app.command("run-agent")
+def run_agent(
+    task_file: Annotated[
+        Path,
+        typer.Argument(exists=True, file_okay=True, dir_okay=False, readable=True),
+    ],
+    base_root: Annotated[
+        Path,
+        typer.Argument(exists=True, file_okay=False, dir_okay=True, readable=True),
+    ],
+    model: Annotated[
+        str | None,
+        typer.Option(help="OpenRouter model slug; defaults to OPENROUTER_MODEL."),
+    ] = None,
+) -> None:
+    """Plan once with OpenRouter, then authorize, execute, verify, and persist."""
+
+    task = _load_task(task_file)
+    planner = _openrouter_planner(model)
+    memory_root = base_root / ".llmin"
+    memory_root.mkdir(exist_ok=True)
+    sink = SQLiteMemoryStore(memory_root / "memory.sqlite3")
+    artifacts = ContentAddressedArtifactStore(memory_root / "artifacts")
+    sandbox_factory = SandboxFactory(base_root)
+    pipeline = Pipeline(
+        planner=planner,
+        executor=Executor(
+            CapabilityRegistry.with_builtins(),
+            sandbox_factory=sandbox_factory,
+            trace_sink=sink,
+        ),
+        verification=VerificationService(
+            VerifierRegistry.with_builtins(),
+            sandbox_factory=sandbox_factory,
+            trace_sink=sink,
+        ),
+        trace_sink=sink,
+    )
+    coordinated = AttemptCoordinator(memory=sink, artifacts=artifacts).run(
+        pipeline=pipeline,
+        task=task,
+        environment_attributes=EnvironmentProbe().capture(),
+    )
+    result = coordinated.result
+    plan = result.execution_plan
+    summary = {
+        "task_id": str(task.task_id),
+        "attempt_id": str(result.attempt_id),
+        "trace_id": str(result.trace_id),
+        "model": planner.model,
+        "final_state": result.final_state.value,
+        "planner_kind": plan.planner_kind.value if plan is not None else None,
+        "estimated_cost_usd": (
+            str(plan.estimated_cost_usd) if plan is not None else None
+        ),
+        "execution_success": (
+            result.execution_report.success if result.execution_report is not None else None
+        ),
+        "verification_verdict": (
+            result.verification_report.verdict.value
+            if result.verification_report is not None
+            else None
+        ),
+    }
+    typer.echo(json.dumps(summary, ensure_ascii=False, sort_keys=True))
+    if result.final_state is not TaskState.COMPLETED:
+        raise typer.Exit(code=1)
 
 
 @app.command("run-fixture")
