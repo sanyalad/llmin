@@ -159,9 +159,7 @@ def run_agent(
         "model": planner.model,
         "final_state": result.final_state.value,
         "planner_kind": plan.planner_kind.value if plan is not None else None,
-        "estimated_cost_usd": (
-            str(plan.estimated_cost_usd) if plan is not None else None
-        ),
+        "estimated_cost_usd": (str(plan.estimated_cost_usd) if plan is not None else None),
         "execution_success": (
             result.execution_report.success if result.execution_report is not None else None
         ),
