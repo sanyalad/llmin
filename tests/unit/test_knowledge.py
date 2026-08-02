@@ -18,8 +18,12 @@ from llmin.knowledge import (
     RouteOutcome,
     task_signature,
 )
-from llmin.memory import ActivationState, Applicability, Provenance, RetentionPolicy
-
+from llmin.memory import (
+    ActivationState,
+    Applicability,
+    Provenance,
+    RetentionPolicy,
+)
 
 ENVIRONMENT = "a" * 64
 
