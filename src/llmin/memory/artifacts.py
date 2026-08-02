@@ -8,8 +8,10 @@ import os
 import stat
 import tempfile
 import tomllib
-from pathlib import Path, PurePosixPath
+from pathlib import Path
+from threading import Lock
 
+from llmin.domain import normalize_relative_path
 from llmin.memory.models import ArtifactBlob
 from llmin.observability import redact
 
@@ -20,6 +22,8 @@ _SUPPORTED_TEXT_MEDIA_TYPES = frozenset(
         "text/plain",
     }
 )
+_LOCKS_GUARD = Lock()
+_STORE_LOCKS: dict[Path, Lock] = {}
 
 
 class ArtifactStoreError(ValueError):
@@ -44,6 +48,8 @@ class ContentAddressedArtifactStore:
         self.root = root.resolve(strict=True)
         self._max_blob_bytes = max_blob_bytes
         self._max_total_bytes = max_total_bytes
+        with _LOCKS_GUARD:
+            self._write_lock = _STORE_LOCKS.setdefault(self.root, Lock())
 
     def put(
         self,
@@ -54,21 +60,23 @@ class ContentAddressedArtifactStore:
     ) -> ArtifactBlob:
         if media_type not in _SUPPORTED_TEXT_MEDIA_TYPES:
             raise ArtifactStoreError("Stage 1 artifact store accepts only allowlisted text media")
-        if not logical_name or not PurePosixPath(logical_name).is_relative_to(PurePosixPath(".")):
-            raise ArtifactStoreError("artifact logical name must be a relative portable path")
-        if "\\" in logical_name or any(
-            part in {"", ".", ".."} for part in PurePosixPath(logical_name).parts
-        ):
-            raise ArtifactStoreError("artifact logical name must be normalized and relative")
+        if any(ord(character) < 32 or ord(character) == 127 for character in logical_name):
+            raise ArtifactStoreError("artifact logical name cannot contain control characters")
+        try:
+            logical_name = normalize_relative_path(logical_name)
+        except ValueError as error:
+            raise ArtifactStoreError(
+                "artifact logical name must be normalized and relative"
+            ) from error
+        if "\x00" in logical_name:
+            raise ArtifactStoreError("artifact logical name cannot contain NUL")
         if len(content) > self._max_blob_bytes:
             raise ArtifactStoreError("artifact payload exceeds per-blob quota")
         try:
             text = content.decode("utf-8")
         except UnicodeError as error:
             raise ArtifactStoreError("Stage 1 artifacts must be valid UTF-8") from error
-        if redact(text) != text:
-            raise ArtifactStoreError("artifact payload contains data requiring redaction")
-        self._validate_media_type(text, media_type)
+        self._validate_payload(text, media_type)
         digest = hashlib.sha256(content).hexdigest()
         blob = ArtifactBlob(
             sha256=digest,
@@ -76,46 +84,47 @@ class ContentAddressedArtifactStore:
             media_type=media_type,
             logical_name=logical_name,
         )
-        directory = self.root / digest[:2]
-        self._require_safe_path(directory, allow_missing=True)
-        directory.mkdir(exist_ok=True)
-        self._require_safe_path(directory)
-        path = directory / digest
-        self._require_safe_path(path, allow_missing=True)
-        if path.exists():
-            self._verify(path, blob)
-            return blob
-        if self._stored_bytes() + len(content) > self._max_total_bytes:
-            raise ArtifactStoreError("artifact store total quota would be exceeded")
-
-        temporary_path: Path | None = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                dir=directory,
-                prefix=f".{digest}.",
-                delete=False,
-            ) as stream:
-                temporary_path = Path(stream.name)
-                stream.write(content)
-                stream.flush()
-                os.fsync(stream.fileno())
-            try:
-                temporary_path.replace(path)
-            except FileExistsError:
+        with self._write_lock:
+            directory = self.root / digest[:2]
+            self._require_safe_path(directory, allow_missing=True)
+            directory.mkdir(exist_ok=True)
+            self._require_safe_path(directory)
+            path = directory / digest
+            self._require_safe_path(path, allow_missing=True)
+            if path.exists():
                 self._verify(path, blob)
-            if os.name != "nt":
-                directory_fd = os.open(directory, os.O_RDONLY)
+                return blob
+            if self._stored_bytes() + len(content) > self._max_total_bytes:
+                raise ArtifactStoreError("artifact store total quota would be exceeded")
+
+            temporary_path: Path | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    dir=directory,
+                    prefix=f".{digest}.",
+                    delete=False,
+                ) as stream:
+                    temporary_path = Path(stream.name)
+                    stream.write(content)
+                    stream.flush()
+                    os.fsync(stream.fileno())
                 try:
-                    os.fsync(directory_fd)
-                finally:
-                    os.close(directory_fd)
-            if os.name != "nt":
-                path.chmod(0o400)
-        except OSError as error:
-            raise ArtifactStoreError(f"artifact write failed: {error}") from error
-        finally:
-            if temporary_path is not None and temporary_path.exists():
-                temporary_path.unlink()
+                    temporary_path.replace(path)
+                except FileExistsError:
+                    self._verify(path, blob)
+                if os.name != "nt":
+                    directory_fd = os.open(directory, os.O_RDONLY)
+                    try:
+                        os.fsync(directory_fd)
+                    finally:
+                        os.close(directory_fd)
+                if os.name != "nt":
+                    path.chmod(0o400)
+            except OSError as error:
+                raise ArtifactStoreError(f"artifact write failed: {error}") from error
+            finally:
+                if temporary_path is not None and temporary_path.exists():
+                    temporary_path.unlink()
         self._verify(path, blob)
         return blob
 
@@ -168,16 +177,20 @@ class ContentAddressedArtifactStore:
         return total
 
     @staticmethod
-    def _validate_media_type(text: str, media_type: str) -> None:
+    def _validate_payload(text: str, media_type: str) -> None:
         try:
             if media_type == "application/json":
-                json.loads(text)
+                parsed = json.loads(text)
             elif media_type == "application/toml":
-                tomllib.loads(text)
+                parsed = tomllib.loads(text)
+            else:
+                parsed = text
         except (json.JSONDecodeError, tomllib.TOMLDecodeError) as error:
             raise ArtifactStoreError(
                 f"artifact does not match declared {media_type} format"
             ) from error
+        if redact(parsed) != parsed:
+            raise ArtifactStoreError("artifact payload contains data requiring redaction")
 
     @staticmethod
     def _verify(path: Path, blob: ArtifactBlob) -> None:

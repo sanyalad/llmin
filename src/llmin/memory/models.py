@@ -472,6 +472,12 @@ class AttemptRecord(ContractModel):
                 raise ValueError("open attempts cannot contain finalized outputs")
         elif self.final_state is None or self.finalized_at is None:
             raise ValueError("finalized attempts require final state and timestamp")
+        if self.status is AttemptStatus.FINALIZED and self.final_state not in {
+            TaskState.COMPLETED,
+            TaskState.FAILED,
+            TaskState.ESCALATED,
+        }:
+            raise ValueError("finalized attempts require a terminal final state")
         if self.final_state is TaskState.COMPLETED:
             if self.execution_report is None or not self.execution_report.success:
                 raise ValueError("completed attempts require successful execution")
@@ -481,3 +487,14 @@ class AttemptRecord(ContractModel):
             ):
                 raise ValueError("completed attempts require passed verification")
         return self
+
+
+class RecordingReceipt(ContractModel):
+    """Verifiable proof that one terminal attempt document was durably committed."""
+
+    attempt_id: UUID
+    trace_id: UUID
+    task_id: UUID
+    record_status: Literal[AttemptStatus.FINALIZED] = AttemptStatus.FINALIZED
+    document_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    storage_transaction_id: UUID

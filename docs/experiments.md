@@ -21,7 +21,7 @@
 Гипотеза: ограниченная config patch задача может пройти полный исполнительный путь, причём
 `COMPLETED` невозможно без независимого `PASSED`.
 
-Текущие средства: `benchmarks/stage1-suite.json`, `llmin run-benchmark`, unit и integration
+Текущие средства: `benchmarks/stage1-suite.json`, `llmin benchmark`, unit и integration
 tests. Этот эксперимент подтверждает фундамент исполнения, но не доказывает обучение:
 используется fake planner, а learned route отсутствует.
 
@@ -72,4 +72,3 @@ Artifacts:
 Decision:
 Follow-up:
 ```
-

@@ -8,10 +8,10 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from llmin.domain import Evidence, ExecutionPlan, TaskSpec, VerificationReport
-from llmin.domain.json_types import canonical_json
+from llmin.domain.json_types import canonical_json, canonical_sha256
 from llmin.execution import ExecutionReport
 from llmin.memory.models import (
     ArtifactBlob,
@@ -26,12 +26,14 @@ from llmin.memory.models import (
     Episode,
     EpisodeTransition,
     MemoryState,
+    RecordingReceipt,
     artifact_content_hash,
 )
 from llmin.observability import TraceEvent, redact
 from llmin.orchestrator import TaskState
+from llmin.orchestrator.state_machine import ALLOWED_TRANSITIONS
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 _ALLOWED_TRANSITIONS = {
     MemoryState.ACTIVE: frozenset(
         {MemoryState.COLD, MemoryState.QUARANTINED, MemoryState.TOMBSTONED}
@@ -61,25 +63,9 @@ class SQLiteMemoryStore:
         sanitized = TraceEvent.model_validate(
             {**event.model_dump(), "payload": redact(event.payload)}
         )
-        document = canonical_json(sanitized)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            existing = connection.execute(
-                "SELECT document FROM trace_events WHERE event_id = ?",
-                (str(sanitized.event_id),),
-            ).fetchone()
-            if existing is not None:
-                self._require_identical(existing[0], document, "trace event")
-                return
-            sequence = connection.execute(
-                "SELECT COALESCE(MAX(sequence), 0) + 1 FROM trace_events WHERE attempt_id = ?",
-                (str(sanitized.attempt_id),),
-            ).fetchone()[0]
-            connection.execute(
-                "INSERT INTO trace_events(event_id, attempt_id, sequence, document) "
-                "VALUES (?, ?, ?, ?)",
-                (str(sanitized.event_id), str(sanitized.attempt_id), sequence, document),
-            )
+            self._insert_trace(connection, sanitized)
 
     def emit(self, event: TraceEvent) -> None:
         """Implement TraceSink so pipelines can persist events at the redaction boundary."""
@@ -187,6 +173,30 @@ class SQLiteMemoryStore:
         artifacts: tuple[ArtifactBlob, ...] = (),
         finalized_at: datetime | None = None,
     ) -> AttemptRecord:
+        record, _receipt = self.finalize_attempt_with_receipt(
+            attempt_id,
+            plan=plan,
+            final_state=final_state,
+            execution_report=execution_report,
+            verification_report=verification_report,
+            artifacts=artifacts,
+            finalized_at=finalized_at,
+        )
+        return record
+
+    def finalize_attempt_with_receipt(
+        self,
+        attempt_id: UUID,
+        *,
+        plan: ExecutionPlan | None = None,
+        final_state: TaskState,
+        execution_report: ExecutionReport | None,
+        verification_report: VerificationReport | None,
+        artifacts: tuple[ArtifactBlob, ...] = (),
+        finalized_at: datetime | None = None,
+    ) -> tuple[AttemptRecord, RecordingReceipt]:
+        """Atomically commit terminal trace transitions, evidence, attempt, and receipt."""
+
         timestamp = finalized_at or datetime.now(UTC)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -221,7 +231,14 @@ class SQLiteMemoryStore:
             document = canonical_json(candidate)
             if current.status is AttemptStatus.FINALIZED:
                 self._require_identical(row[0], document, "finalized attempt")
-                return current
+                receipt = self._read_recording_receipt(connection, current.attempt_id)
+                if receipt is None:
+                    raise MemoryStoreError("finalized attempt has no recording receipt")
+                return current, receipt
+
+            if candidate.final_state is TaskState.COMPLETED:
+                self._append_terminal_completion_events(connection, candidate)
+            self._validate_lifecycle_trace(connection, candidate)
             if verification_report is not None:
                 persisted_verification = candidate.verification_report
                 if persisted_verification is None:
@@ -232,7 +249,23 @@ class SQLiteMemoryStore:
                 "UPDATE attempts SET status = ?, document = ? WHERE attempt_id = ?",
                 (AttemptStatus.FINALIZED.value, document, str(attempt_id)),
             )
-        return candidate
+            receipt = RecordingReceipt(
+                attempt_id=candidate.attempt_id,
+                trace_id=candidate.trace_id,
+                task_id=candidate.task.task_id,
+                document_hash=canonical_sha256(candidate),
+                storage_transaction_id=uuid4(),
+            )
+            connection.execute(
+                "INSERT INTO recording_receipts(attempt_id, transaction_id, document) "
+                "VALUES (?, ?, ?)",
+                (
+                    str(candidate.attempt_id),
+                    str(receipt.storage_transaction_id),
+                    canonical_json(receipt),
+                ),
+            )
+        return candidate, receipt
 
     def get_attempt(self, attempt_id: UUID) -> AttemptRecord | None:
         with self._connect() as connection:
@@ -241,6 +274,10 @@ class SQLiteMemoryStore:
                 (str(attempt_id),),
             ).fetchone()
         return AttemptRecord.model_validate_json(row[0]) if row is not None else None
+
+    def get_recording_receipt(self, attempt_id: UUID) -> RecordingReceipt | None:
+        with self._connect() as connection:
+            return self._read_recording_receipt(connection, attempt_id)
 
     def create_episode(self, episode: Episode) -> None:
         if episode.state is not MemoryState.ACTIVE:
@@ -535,6 +572,152 @@ class SQLiteMemoryStore:
             (str(evidence.evidence_id), str(attempt_id), document),
         )
 
+    def _insert_trace(
+        self,
+        connection: sqlite3.Connection,
+        event: TraceEvent,
+    ) -> None:
+        document = canonical_json(event)
+        existing = connection.execute(
+            "SELECT document FROM trace_events WHERE event_id = ?",
+            (str(event.event_id),),
+        ).fetchone()
+        if existing is not None:
+            self._require_identical(existing[0], document, "trace event")
+            return
+        sequence = connection.execute(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM trace_events WHERE attempt_id = ?",
+            (str(event.attempt_id),),
+        ).fetchone()[0]
+        connection.execute(
+            "INSERT INTO trace_events(event_id, attempt_id, sequence, document) "
+            "VALUES (?, ?, ?, ?)",
+            (str(event.event_id), str(event.attempt_id), sequence, document),
+        )
+
+    def _append_terminal_completion_events(
+        self,
+        connection: sqlite3.Connection,
+        attempt: AttemptRecord,
+    ) -> None:
+        rows = connection.execute(
+            "SELECT document FROM trace_events WHERE attempt_id = ? ORDER BY sequence",
+            (str(attempt.attempt_id),),
+        ).fetchall()
+        events = [TraceEvent.model_validate_json(row[0]) for row in rows]
+        transitions = [event for event in events if event.event_type == "orchestrator.transition"]
+        if not events or not transitions:
+            raise MemoryStoreError("completed attempt requires a persisted lifecycle trace")
+        last = transitions[-1]
+        if last is not events[-1] or last.payload.get("to_state") != TaskState.VERIFIED.value:
+            raise MemoryStoreError("completed attempt trace must end at verified")
+        try:
+            next_sequence = int(last.payload["sequence"]) + 1
+        except (KeyError, TypeError, ValueError) as error:
+            raise MemoryStoreError("lifecycle transition has an invalid sequence") from error
+
+        recorded = TraceEvent(
+            trace_id=attempt.trace_id,
+            task_id=attempt.task.task_id,
+            attempt_id=attempt.attempt_id,
+            event_type="orchestrator.transition",
+            payload={
+                "sequence": next_sequence,
+                "from_state": TaskState.VERIFIED.value,
+                "to_state": TaskState.RECORDED.value,
+                "reason": "attempt and verification evidence durably recorded",
+            },
+        )
+        completed = TraceEvent(
+            trace_id=attempt.trace_id,
+            task_id=attempt.task.task_id,
+            attempt_id=attempt.attempt_id,
+            event_type="orchestrator.transition",
+            payload={
+                "sequence": next_sequence + 1,
+                "from_state": TaskState.RECORDED.value,
+                "to_state": TaskState.COMPLETED.value,
+                "reason": "terminal lifecycle committed atomically",
+            },
+        )
+        self._insert_trace(connection, recorded)
+        self._insert_trace(connection, completed)
+
+    @staticmethod
+    def _validate_lifecycle_trace(
+        connection: sqlite3.Connection,
+        attempt: AttemptRecord,
+    ) -> None:
+        rows = connection.execute(
+            "SELECT document FROM trace_events WHERE attempt_id = ? ORDER BY sequence",
+            (str(attempt.attempt_id),),
+        ).fetchall()
+        events = [TraceEvent.model_validate_json(row[0]) for row in rows]
+        if not events:
+            raise MemoryStoreError("finalized attempt requires a non-empty lifecycle trace")
+        if any(
+            event.task_id != attempt.task.task_id
+            or event.trace_id != attempt.trace_id
+            or event.attempt_id != attempt.attempt_id
+            for event in events
+        ):
+            raise MemoryStoreError("attempt trace belongs to another task, trace, or attempt")
+
+        current = TaskState.RECEIVED
+        transition_count = 0
+        verified_event_index: int | None = None
+        terminal_event_index: int | None = None
+        for event_index, event in enumerate(events):
+            if event.event_type != "orchestrator.transition":
+                continue
+            transition_count += 1
+            try:
+                sequence = int(event.payload["sequence"])
+                source = TaskState(str(event.payload["from_state"]))
+                target = TaskState(str(event.payload["to_state"]))
+            except (KeyError, TypeError, ValueError) as error:
+                raise MemoryStoreError("lifecycle transition payload is invalid") from error
+            if sequence != transition_count:
+                raise MemoryStoreError("lifecycle transition sequence is not contiguous")
+            if source is not current or target not in ALLOWED_TRANSITIONS[current]:
+                raise MemoryStoreError("lifecycle trace contains an invalid state transition")
+            current = target
+            if target is TaskState.VERIFIED:
+                verified_event_index = event_index
+            if target in {TaskState.COMPLETED, TaskState.FAILED, TaskState.ESCALATED}:
+                terminal_event_index = event_index
+                if event_index != len(events) - 1:
+                    raise MemoryStoreError("lifecycle trace contains events after terminal state")
+
+        if transition_count == 0 or current is not attempt.final_state:
+            raise MemoryStoreError("lifecycle trace terminal state does not match attempt")
+        if terminal_event_index is None:
+            raise MemoryStoreError("finalized attempt trace has no terminal transition")
+        if attempt.final_state is TaskState.COMPLETED:
+            if verified_event_index is None or attempt.verification_report is None:
+                raise MemoryStoreError("completed attempt trace has no verified checkpoint")
+            verification_indexes = [
+                index
+                for index, event in enumerate(events)
+                if event.event_type == "verification.completed"
+                and event.payload.get("report_id") == str(attempt.verification_report.report_id)
+            ]
+            if not verification_indexes or verification_indexes[-1] >= verified_event_index:
+                raise MemoryStoreError(
+                    "verification.completed must precede the verified transition"
+                )
+
+    @staticmethod
+    def _read_recording_receipt(
+        connection: sqlite3.Connection,
+        attempt_id: UUID,
+    ) -> RecordingReceipt | None:
+        row = connection.execute(
+            "SELECT document FROM recording_receipts WHERE attempt_id = ?",
+            (str(attempt_id),),
+        ).fetchone()
+        return RecordingReceipt.model_validate_json(row[0]) if row is not None else None
+
     @staticmethod
     def _insert_environment(
         connection: sqlite3.Connection,
@@ -660,6 +843,11 @@ class SQLiteMemoryStore:
                     status TEXT NOT NULL,
                     document TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS recording_receipts (
+                    attempt_id TEXT PRIMARY KEY REFERENCES attempts(attempt_id),
+                    transaction_id TEXT NOT NULL UNIQUE,
+                    document TEXT NOT NULL
+                );
                 """
             )
             row = connection.execute(
@@ -670,10 +858,55 @@ class SQLiteMemoryStore:
                     "INSERT INTO schema_metadata(singleton, version) VALUES (1, ?)",
                     (_SCHEMA_VERSION,),
                 )
-            elif row[0] == 2:
+            elif row[0] in {2, 3}:
+                self._migrate_documents_to_v4(connection)
                 connection.execute(
                     "UPDATE schema_metadata SET version = ? WHERE singleton = 1",
                     (_SCHEMA_VERSION,),
                 )
             elif row[0] != _SCHEMA_VERSION:
                 raise MemoryStoreError(f"unsupported memory schema version: {row[0]}")
+
+    @staticmethod
+    def _migrate_documents_to_v4(connection: sqlite3.Connection) -> None:
+        document_models = {
+            "trace_events": TraceEvent,
+            "evidence": Evidence,
+            "cost_entries": CostEntry,
+            "episodes": Episode,
+            "episode_transitions": EpisodeTransition,
+            "artifact_relations": ArtifactRelation,
+            "contradictions": ContradictionRecord,
+            "environments": EnvironmentRecord,
+            "attempts": AttemptRecord,
+        }
+        for table, model in document_models.items():
+            rows = connection.execute(f"SELECT rowid, document FROM {table}").fetchall()
+            for rowid, document in rows:
+                canonical_document = canonical_json(model.model_validate_json(document))
+                connection.execute(
+                    f"UPDATE {table} SET document = ? WHERE rowid = ?",
+                    (canonical_document, rowid),
+                )
+
+        rows = connection.execute("SELECT attempt_id, status, document FROM attempts").fetchall()
+        for attempt_id, status, document in rows:
+            attempt = AttemptRecord.model_validate_json(document)
+            if status != AttemptStatus.FINALIZED.value:
+                continue
+            transaction_id = uuid5(
+                NAMESPACE_URL,
+                f"https://llmin.local/migration/v4/attempt/{attempt_id}",
+            )
+            receipt = RecordingReceipt(
+                attempt_id=attempt.attempt_id,
+                trace_id=attempt.trace_id,
+                task_id=attempt.task.task_id,
+                document_hash=canonical_sha256(attempt),
+                storage_transaction_id=transaction_id,
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO recording_receipts"
+                "(attempt_id, transaction_id, document) VALUES (?, ?, ?)",
+                (attempt_id, str(transaction_id), canonical_json(receipt)),
+            )

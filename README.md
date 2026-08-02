@@ -70,4 +70,11 @@ llmin validate-task benchmarks\tasks\config_patch\001.json
 llmin run-fixture <task.json> <plan.json> <base-root>
 ```
 
+Команда возвращает `attempt_id` и `trace_id`. Сохранённый статус, диагностические события и
+evidence можно повторно получить из SQLite, в том числе из нового процесса:
+
+```powershell
+llmin show-attempt <base-root>\.llmin\memory.sqlite3 <attempt-id>
+```
+
 Состояние `COMPLETED` возможно только после verifier verdict `PASSED`.

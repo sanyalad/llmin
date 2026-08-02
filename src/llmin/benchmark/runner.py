@@ -36,6 +36,7 @@ from llmin.execution import CapabilityRegistry, Executor, SandboxFactory
 from llmin.memory import (
     AttemptCoordinator,
     ContentAddressedArtifactStore,
+    EnvironmentProbe,
     SQLiteMemoryStore,
 )
 from llmin.orchestrator import TaskState
@@ -195,11 +196,7 @@ class BenchmarkRunner:
         coordinated = AttemptCoordinator(memory=sink, artifacts=artifacts).run(
             pipeline=pipeline,
             task=task,
-            environment_attributes={
-                "benchmark_suite": suite.name,
-                "case_id": case.case_id,
-                "family": task.family,
-            },
+            environment_attributes=EnvironmentProbe().capture(),
         )
         result = coordinated.result
         elapsed_ms = (perf_counter() - started) * 1_000

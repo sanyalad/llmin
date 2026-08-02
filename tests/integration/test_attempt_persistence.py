@@ -1,4 +1,5 @@
 import hashlib
+import inspect
 import shutil
 import sqlite3
 from dataclasses import replace
@@ -17,11 +18,13 @@ from llmin.memory import (
     AttemptRecorder,
     AttemptStatus,
     ContentAddressedArtifactStore,
+    EnvironmentProbe,
     EnvironmentRecord,
     MemoryStoreError,
     SQLiteMemoryStore,
     environment_content_hash,
 )
+from llmin.observability import InMemoryTraceSink
 from llmin.orchestrator import TaskState
 from llmin.pipeline import Pipeline, PipelineResult
 from llmin.planning import FakePlanner
@@ -141,6 +144,35 @@ def test_artifact_store_enforces_declared_format_and_quota(tmp_path: Path) -> No
     store.put(b"one", logical_name="one.txt")
     with pytest.raises(ArtifactStoreError, match="total quota"):
         store.put(b"x" * 32, logical_name="two.txt")
+
+
+@pytest.mark.parametrize(
+    ("payload", "media_type"),
+    [
+        (b'{"authorization":"Basic dXNlcjpwYXNz"}', "application/json"),
+        (b'[service]\ncookie = "session-value"\n', "application/toml"),
+    ],
+)
+def test_artifact_store_rejects_structured_secret_keys(
+    tmp_path: Path,
+    payload: bytes,
+    media_type: str,
+) -> None:
+    store = ContentAddressedArtifactStore(tmp_path / "artifacts")
+
+    with pytest.raises(ArtifactStoreError, match="requiring redaction"):
+        store.put(payload, logical_name="structured.txt", media_type=media_type)
+
+
+@pytest.mark.parametrize("logical_name", ["a//b.txt", "a/./b.txt", "C:/file.txt", "a/\x00.txt"])
+def test_artifact_store_rejects_non_normalized_logical_names(
+    tmp_path: Path,
+    logical_name: str,
+) -> None:
+    store = ContentAddressedArtifactStore(tmp_path / "artifacts")
+
+    with pytest.raises(ArtifactStoreError, match="logical name"):
+        store.put(b"safe", logical_name=logical_name)
 
 
 def test_artifact_store_rejects_symlink_shard(tmp_path: Path) -> None:
@@ -268,7 +300,7 @@ def test_coordinator_opens_attempt_before_planning_and_closes_identity_chain(
         pipeline=pipeline,
         task=task,
         environment_attributes={"os": "test"},
-        artifact_payloads={
+        artifact_collector=lambda _result: {
             "config.toml": ((workspace / "config.toml").read_bytes(), "application/toml")
         },
         trace_id=trace_id,
@@ -278,6 +310,12 @@ def test_coordinator_opens_attempt_before_planning_and_closes_identity_chain(
     assert coordinated.result.attempt_id == attempt_id
     assert coordinated.record.status is AttemptStatus.FINALIZED
     assert coordinated.record.plan == plan
+    assert coordinated.receipt.attempt_id == attempt_id
+    assert memory.get_recording_receipt(attempt_id) == coordinated.receipt
+    assert (
+        artifacts.read(coordinated.record.artifacts[0]) == (workspace / "config.toml").read_bytes()
+    )
+    assert b"timeout = 30" in artifacts.read(coordinated.record.artifacts[0])
     journal = memory.reconstruct_attempt(attempt_id)
     assert journal.trace_events
     assert all(event.task_id == task.task_id for event in journal.trace_events)
@@ -345,7 +383,7 @@ def test_persistence_failure_never_emits_recorded_or_completed(tmp_path: Path) -
             pipeline=pipeline,
             task=task,
             environment_attributes={"os": "test"},
-            artifact_payloads={
+            artifact_collector=lambda _result: {
                 "unsafe.txt": (b"password=do-not-store\n", "text/plain"),
             },
             attempt_id=attempt_id,
@@ -362,6 +400,127 @@ def test_persistence_failure_never_emits_recorded_or_completed(tmp_path: Path) -
     assert transitions[-1] == TaskState.VERIFIED.value
     assert TaskState.RECORDED.value not in transitions
     assert TaskState.COMPLETED.value not in transitions
+
+
+def test_terminal_trace_failure_rolls_back_attempt_and_events(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    memory = SQLiteMemoryStore(tmp_path / "memory.sqlite3")
+    artifacts = ContentAddressedArtifactStore(tmp_path / "artifacts")
+    task, plan, _workspace = load_fixture(tmp_path)
+    attempt_id = uuid4()
+    original_insert_trace = memory._insert_trace
+
+    def fail_recorded_transition(connection: object, event: object) -> None:
+        if (
+            getattr(event, "event_type", None) == "orchestrator.transition"
+            and getattr(event, "payload", {}).get("to_state") == TaskState.RECORDED.value
+        ):
+            raise RuntimeError("post-verified terminal trace failure")
+        original_insert_trace(connection, event)
+
+    monkeypatch.setattr(memory, "_insert_trace", fail_recorded_transition)
+    factory = SandboxFactory(tmp_path)
+    pipeline = Pipeline(
+        planner=FakePlanner(lambda _task: plan),
+        executor=Executor(
+            CapabilityRegistry.with_builtins(), sandbox_factory=factory, trace_sink=memory
+        ),
+        verification=VerificationService(
+            VerifierRegistry.with_builtins(), sandbox_factory=factory, trace_sink=memory
+        ),
+        trace_sink=memory,
+    )
+
+    with pytest.raises(RuntimeError, match="terminal trace failure"):
+        AttemptCoordinator(memory=memory, artifacts=artifacts).run(
+            pipeline=pipeline,
+            task=task,
+            environment_attributes={"os": "test"},
+            attempt_id=attempt_id,
+        )
+
+    stored = memory.get_attempt(attempt_id)
+    assert stored is not None and stored.status is AttemptStatus.OPEN
+    transitions = [
+        event.payload["to_state"]
+        for event in memory.reconstruct_attempt(attempt_id).trace_events
+        if event.event_type == "orchestrator.transition"
+    ]
+    assert transitions[-1] == TaskState.VERIFIED.value
+    assert TaskState.RECORDED.value not in transitions
+    assert TaskState.COMPLETED.value not in transitions
+
+
+def test_pipeline_has_no_public_completion_callback() -> None:
+    assert "completion_gate" not in inspect.signature(Pipeline.run).parameters
+
+
+def test_coordinator_rejects_pipeline_using_another_trace_sink(tmp_path: Path) -> None:
+    memory = SQLiteMemoryStore(tmp_path / "memory.sqlite3")
+    artifacts = ContentAddressedArtifactStore(tmp_path / "artifacts")
+    task, plan, _workspace = load_fixture(tmp_path)
+    other_sink = InMemoryTraceSink()
+    factory = SandboxFactory(tmp_path)
+    pipeline = Pipeline(
+        planner=FakePlanner(lambda _task: plan),
+        executor=Executor(
+            CapabilityRegistry.with_builtins(),
+            sandbox_factory=factory,
+            trace_sink=other_sink,
+        ),
+        verification=VerificationService(
+            VerifierRegistry.with_builtins(),
+            sandbox_factory=factory,
+            trace_sink=other_sink,
+        ),
+        trace_sink=other_sink,
+    )
+
+    with pytest.raises(MemoryStoreError, match="persisted lifecycle trace"):
+        AttemptCoordinator(memory=memory, artifacts=artifacts).run(
+            pipeline=pipeline,
+            task=task,
+            environment_attributes={"os": "test"},
+        )
+
+
+def test_storage_rejects_finalized_nonterminal_attempt(tmp_path: Path) -> None:
+    memory = SQLiteMemoryStore(tmp_path / "memory.sqlite3")
+    task, _workspace, result = run_fixture(tmp_path, memory)
+    environment = EnvironmentRecord(
+        fingerprint=environment_content_hash({"os": "test"}),
+        attributes={"os": "test"},
+    )
+    memory.begin_attempt(
+        attempt_id=result.attempt_id,
+        trace_id=result.trace_id,
+        task=task,
+        plan=result.execution_plan,
+        environment=environment,
+    )
+
+    with pytest.raises(ValidationError, match="terminal final state"):
+        memory.finalize_attempt(
+            result.attempt_id,
+            final_state=TaskState.VERIFIED,
+            execution_report=result.execution_report,
+            verification_report=result.verification_report,
+        )
+
+
+def test_environment_probe_captures_compatibility_versions_without_local_path() -> None:
+    attributes = EnvironmentProbe().capture()
+
+    assert attributes["runtime"]["os"]
+    assert attributes["runtime"]["architecture"]
+    assert attributes["runtime"]["python_version"]
+    assert attributes["implementation"]["llmin_version"]
+    assert attributes["contracts"]["memory_schema"] == 4
+    assert attributes["capabilities"]["patch_toml"] == "stage1-v1"
+    assert attributes["verifiers"]["toml_value_equals"] == "stage1-v1"
+    assert "base_root" not in str(attributes)
 
 
 def test_recorder_rejects_result_for_another_task(tmp_path: Path) -> None:
@@ -400,7 +559,7 @@ def test_canonical_contract_serialization_sorts_set_fields(tmp_path: Path) -> No
     assert canonical_json(first) == canonical_json(second)
 
 
-def test_schema_v2_database_is_migrated_to_v3(tmp_path: Path) -> None:
+def test_schema_v2_database_is_migrated_to_v4(tmp_path: Path) -> None:
     path = tmp_path / "memory.sqlite3"
     SQLiteMemoryStore(path)
     with sqlite3.connect(path) as connection:
@@ -420,5 +579,5 @@ def test_schema_v2_database_is_migrated_to_v3(tmp_path: Path) -> None:
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             ).fetchall()
         }
-    assert version == 3
-    assert {"attempts", "environments"}.issubset(tables)
+    assert version == 4
+    assert {"attempts", "environments", "recording_receipts"}.issubset(tables)

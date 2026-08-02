@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
 from uuid import UUID
 
@@ -45,9 +44,12 @@ class Pipeline:
         *,
         trace_id: UUID | None = None,
         attempt_id: UUID | None = None,
-        completion_gate: Callable[[PipelineResult], None] | None = None,
     ) -> PipelineResult:
-        """Execute and verify a task, completing only after an external recording gate."""
+        """Execute and verify a task.
+
+        Durable terminal transitions are owned by AttemptCoordinator and the memory store.
+        A successful standalone pipeline run therefore stops at VERIFIED.
+        """
 
         run = OrchestratorRun(
             task_id=task.task_id,
@@ -76,6 +78,15 @@ class Pipeline:
         run.transition(TaskState.PLANNED, reason="planner produced a structured plan")
         authorization_error = self._executor.authorize(task=task, plan=plan)
         if authorization_error is not None:
+            self._trace_sink.emit(
+                TraceEvent(
+                    trace_id=run.trace_id,
+                    task_id=task.task_id,
+                    attempt_id=run.attempt_id,
+                    event_type="authorization.failed",
+                    payload={"reason": authorization_error},
+                )
+            )
             run.transition(TaskState.FAILED, reason="plan authorization failed")
             return PipelineResult(
                 task.task_id, run.trace_id, run.attempt_id, run.state, plan, None, None
@@ -125,7 +136,7 @@ class Pipeline:
             )
 
         run.transition(TaskState.VERIFIED, reason="independent verifier passed")
-        verified_result = PipelineResult(
+        return PipelineResult(
             task.task_id,
             run.trace_id,
             run.attempt_id,
@@ -134,19 +145,3 @@ class Pipeline:
             execution,
             verification,
         )
-        if completion_gate is None:
-            return verified_result
-
-        completed_result = PipelineResult(
-            task.task_id,
-            run.trace_id,
-            run.attempt_id,
-            TaskState.COMPLETED,
-            plan,
-            execution,
-            verification,
-        )
-        completion_gate(completed_result)
-        run.transition(TaskState.RECORDED, reason="trace and evidence emitted")
-        run.transition(TaskState.COMPLETED, reason="task reached a verified terminal state")
-        return completed_result

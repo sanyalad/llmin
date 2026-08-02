@@ -40,7 +40,8 @@ TaskSpec
   → sandbox Executor
   → independent VerificationService
   → PipelineResult
-  → AttemptRecord / TraceEvent / Evidence / Episode
+  → AttemptRecord / TraceEvent / Evidence
+  → explicit Episode creation (not automatic yet)
   → SQLite + content-addressed blob store
 ```
 
@@ -94,4 +95,3 @@ SQLite, exact-match routing, provider-neutral planner boundary и offline evalua
 - [Архитектурные решения](decisions.md)
 - [Roadmap](roadmap.md)
 - [Журнал экспериментов](experiments.md)
-

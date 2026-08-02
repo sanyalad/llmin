@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, replace
 from uuid import UUID, uuid4
 
 from llmin.domain import TaskSpec
+from llmin.domain.json_types import canonical_sha256
 from llmin.memory.artifacts import ContentAddressedArtifactStore
 from llmin.memory.models import (
     AttemptRecord,
     AttemptStatus,
     EnvironmentRecord,
+    RecordingReceipt,
     environment_content_hash,
 )
 from llmin.memory.sqlite import MemoryStoreError, SQLiteMemoryStore
@@ -26,6 +28,13 @@ class CoordinatedAttempt:
 
     result: PipelineResult
     record: AttemptRecord
+    receipt: RecordingReceipt
+
+
+ArtifactCollector = Callable[
+    [PipelineResult],
+    Mapping[str, tuple[bytes, str]],
+]
 
 
 class AttemptRecorder:
@@ -46,6 +55,22 @@ class AttemptRecorder:
         environment_attributes: dict[str, object],
         artifact_payloads: Mapping[str, tuple[bytes, str]] | None = None,
     ) -> AttemptRecord:
+        record, _receipt = self.record_with_receipt(
+            task=task,
+            result=result,
+            environment_attributes=environment_attributes,
+            artifact_payloads=artifact_payloads,
+        )
+        return record
+
+    def record_with_receipt(
+        self,
+        *,
+        task: TaskSpec,
+        result: PipelineResult,
+        environment_attributes: dict[str, object],
+        artifact_payloads: Mapping[str, tuple[bytes, str]] | None = None,
+    ) -> tuple[AttemptRecord, RecordingReceipt]:
         if result.task_id != task.task_id:
             raise MemoryStoreError("pipeline result belongs to another task")
         if result.final_state not in {
@@ -75,7 +100,7 @@ class AttemptRecorder:
             self._artifacts.put(content, logical_name=name, media_type=media_type)
             for name, (content, media_type) in sorted((artifact_payloads or {}).items())
         )
-        return self._memory.finalize_attempt(
+        return self._memory.finalize_attempt_with_receipt(
             result.attempt_id,
             plan=result.execution_plan,
             final_state=result.final_state,
@@ -129,7 +154,7 @@ class AttemptCoordinator:
         pipeline: Pipeline,
         task: TaskSpec,
         environment_attributes: dict[str, object],
-        artifact_payloads: Mapping[str, tuple[bytes, str]] | None = None,
+        artifact_collector: ArtifactCollector | None = None,
         trace_id: UUID | None = None,
         attempt_id: UUID | None = None,
     ) -> CoordinatedAttempt:
@@ -153,25 +178,12 @@ class AttemptCoordinator:
             )
         else:
             self._validate_prepared_attempt(existing, task, selected_trace_id, environment)
-            if existing.status is AttemptStatus.FINALIZED:
-                raise MemoryStoreError("cannot rerun a finalized attempt")
-
-        recorded: AttemptRecord | None = None
-
-        def persist_completion(candidate: PipelineResult) -> None:
-            nonlocal recorded
-            recorded = self._recorder.record(
-                task=task,
-                result=candidate,
-                environment_attributes=environment_attributes,
-                artifact_payloads=artifact_payloads,
-            )
+            raise MemoryStoreError("an existing attempt cannot be re-executed")
 
         result = pipeline.run(
             task,
             trace_id=selected_trace_id,
             attempt_id=selected_attempt_id,
-            completion_gate=persist_completion,
         )
         if (
             result.task_id != task.task_id
@@ -179,14 +191,28 @@ class AttemptCoordinator:
             or result.attempt_id != selected_attempt_id
         ):
             raise MemoryStoreError("pipeline result does not match the prepared attempt")
-        if recorded is None:
-            recorded = self._recorder.record(
-                task=task,
-                result=result,
-                environment_attributes=environment_attributes,
-                artifact_payloads=artifact_payloads,
-            )
-        return CoordinatedAttempt(result=result, record=recorded)
+        terminal_result = (
+            replace(result, final_state=TaskState.COMPLETED)
+            if result.final_state is TaskState.VERIFIED
+            else result
+        )
+        artifact_payloads = (
+            artifact_collector(terminal_result)
+            if artifact_collector is not None and terminal_result.final_state is TaskState.COMPLETED
+            else None
+        )
+        recorded, receipt = self._recorder.record_with_receipt(
+            task=task,
+            result=terminal_result,
+            environment_attributes=environment_attributes,
+            artifact_payloads=artifact_payloads,
+        )
+        self._validate_receipt(recorded, receipt)
+        return CoordinatedAttempt(
+            result=terminal_result,
+            record=recorded,
+            receipt=receipt,
+        )
 
     @staticmethod
     def _environment(attributes: dict[str, object]) -> EnvironmentRecord:
@@ -209,3 +235,17 @@ class AttemptCoordinator:
             or existing.environment != environment
         ):
             raise MemoryStoreError("attempt identifier was reused with different inputs")
+
+    @staticmethod
+    def _validate_receipt(
+        record: AttemptRecord,
+        receipt: RecordingReceipt,
+    ) -> None:
+        if (
+            receipt.attempt_id != record.attempt_id
+            or receipt.trace_id != record.trace_id
+            or receipt.task_id != record.task.task_id
+            or receipt.record_status is not AttemptStatus.FINALIZED
+            or receipt.document_hash != canonical_sha256(record)
+        ):
+            raise MemoryStoreError("recording receipt does not match finalized attempt")

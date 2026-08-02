@@ -18,12 +18,14 @@ an `AttemptRecord` containing:
 - immutable references to persisted artifacts.
 
 Recording has two explicit phases. `begin_attempt()` creates an `open` record, and
-`finalize_attempt()` atomically commits terminal metadata and verifier evidence in one SQLite
+`finalize_attempt()` atomically commits terminal trace transitions, terminal metadata, verifier
+evidence, and a `RecordingReceipt` in one SQLite
 transaction. `AttemptCoordinator` is the normal pre-run boundary: it creates the open record,
-passes its fixed `trace_id` and `attempt_id` to `Pipeline`, then finalizes that same record. A
-successful direct `Pipeline.run()` stops at `verified`; only a successful coordinator recording
-gate permits the `recorded` and `completed` transitions. Failed persistence therefore leaves the
-attempt open and cannot publish a false terminal success. A
+passes its fixed `trace_id` and `attempt_id` to `Pipeline`, then finalizes that same record. The
+store requires a complete, identity-consistent lifecycle journal and creates `recorded` and
+`completed` inside the finalization transaction. A successful direct `Pipeline.run()` stops at
+`verified`; no public callback can promote it. Failed persistence therefore rolls back terminal
+events and leaves the attempt open. A
 crash before a `PipelineResult` leaves the open record for diagnosis instead of creating a
 trace-only execution. Repeating either persistence operation with identical content is
 idempotent, including direct `begin_attempt()` retries that do not supply a timestamp. Reusing
@@ -36,6 +38,15 @@ verification passed. Cross-task, cross-plan, and cross-attempt report references
 before persistence. If finalization fails, SQLite rolls back evidence and leaves the attempt
 open rather than presenting a partial record as complete.
 
+Output artifacts are collected only after execution and successful verification through an
+`ArtifactCollector`. The coordinator does not accept pre-execution output bytes. An existing
+open attempt cannot be executed again; recovery and persistence retry are separate operations.
+
+CLI and benchmark runs use the same `EnvironmentProbe`. Its fingerprint includes OS,
+architecture, Python and dependency versions, LLMIN revision, capability/verifier versions,
+contract encoding, and supported formats. Workspace paths and task/case identifiers are excluded
+so compatibility identity is portable across equivalent runs.
+
 ## Artifact store
 
 `ContentAddressedArtifactStore` stores redacted UTF-8 artifacts under their SHA-256 digest.
@@ -44,7 +55,8 @@ both existing and newly read content. A digest collision with different content 
 tampering is rejected.
 
 Stage 1 accepts only `text/plain`, `application/json`, and `application/toml`; JSON and TOML are
-parsed before storage. Content rejected by the existing secret-redaction boundary is not stored.
+parsed before storage and recursively checked for sensitive keys. Content rejected by the
+existing secret-redaction boundary is not stored.
 The store enforces per-blob and total-size quotas, validates logical names, and rejects symlink,
 junction, and other reparse-point components below its trusted root. Binary artifacts and
 media-specific sanitizers are deliberately deferred.
@@ -61,9 +73,11 @@ Identifiers are immutable. Repeating the same record is idempotent; reusing an i
 with different content is rejected. `reconstruct_attempt()` returns events in insertion order
 and does not turn them into an episode automatically.
 
-SQLite schema version is checked and migrated on every open. Free-form payloads cross the existing
-redaction boundary before SQL execution, foreign keys are enabled, and secure deletion is
-requested from SQLite. The adapter opens and closes a connection per atomic operation.
+SQLite schema version is checked and migrated on every open. Schema v4 identifies canonical JSON
+document encoding and adds durable recording receipts; older document rows are model-validated
+and rewritten canonically during migration. Free-form payloads cross the existing redaction
+boundary before SQL execution, foreign keys are enabled, and secure deletion is requested from
+SQLite. The adapter opens and closes a connection per atomic operation.
 
 ## Episodes
 

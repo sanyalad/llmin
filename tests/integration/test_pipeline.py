@@ -177,4 +177,6 @@ def test_incompatible_capability_fails_before_execution(tmp_path: Path) -> None:
     assert result.final_state is TaskState.FAILED
     assert result.execution_report is None
     assert result.verification_report is None
+    assert sink.events[-2].event_type == "authorization.failed"
+    assert sink.events[-2].payload["reason"] == "capability is not registered: unknown_capability"
     assert json.loads(sink.events[-1].model_dump_json())["payload"]["to_state"] == "failed"
