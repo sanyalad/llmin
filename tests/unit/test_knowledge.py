@@ -18,12 +18,7 @@ from llmin.knowledge import (
     RouteOutcome,
     task_signature,
 )
-from llmin.memory import (
-    ActivationState,
-    Applicability,
-    Provenance,
-    RetentionPolicy,
-)
+from llmin.memory import ActivationState, Applicability, Provenance, RetentionPolicy
 
 
 ENVIRONMENT = "a" * 64
@@ -41,13 +36,21 @@ def make_task(*, objective: str = "write configuration", max_llm_calls: int = 1)
             allowed_capabilities=frozenset({"write_file"}),
         ),
         postconditions=(
-            Postcondition(type="file_contains", parameters={"path": "app.json", "text": "3"}),
+            Postcondition(
+                type="file_contains",
+                parameters={"path": "app.json", "text": "3"},
+            ),
         ),
         budget=Budget(max_llm_calls=max_llm_calls),
     )
 
 
-def make_skill(task: TaskSpec, *, active: bool = True, environment: str = ENVIRONMENT) -> CompiledSkill:
+def make_skill(
+    task: TaskSpec,
+    *,
+    active: bool = True,
+    environment: str = ENVIRONMENT,
+) -> CompiledSkill:
     skill_id = uuid4()
     report_id = uuid4()
     attempt_id = uuid4()
@@ -55,7 +58,12 @@ def make_skill(task: TaskSpec, *, active: bool = True, environment: str = ENVIRO
         task_id=task.task_id,
         planner_kind=PlannerKind.COMPILED,
         knowledge_artifact_id=skill_id,
-        actions=(Action(capability="write_file", arguments={"path": "app.json", "content": "3"}),),
+        actions=(
+            Action(
+                capability="write_file",
+                arguments={"path": "app.json", "content": "3"},
+            ),
+        ),
     )
     return CompiledSkill(
         artifact_id=skill_id,
@@ -92,7 +100,9 @@ def test_task_signature_ignores_identity_and_budget() -> None:
 
 
 def test_task_signature_changes_with_semantics() -> None:
-    assert task_signature(make_task()) != task_signature(make_task(objective="delete configuration"))
+    assert task_signature(make_task()) != task_signature(
+        make_task(objective="delete configuration")
+    )
 
 
 def test_active_exact_match_returns_compiled_plan_without_llm_call() -> None:
