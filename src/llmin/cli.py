@@ -6,6 +6,7 @@ import json
 import tempfile
 from pathlib import Path
 from typing import Annotated
+from uuid import UUID
 
 import typer
 from pydantic import ValidationError
@@ -14,7 +15,12 @@ from llmin import __version__
 from llmin.benchmark import BenchmarkRunner, BenchmarkSplit, BenchmarkSuite
 from llmin.domain import ExecutionPlan, TaskSpec
 from llmin.execution import CapabilityRegistry, Executor, SandboxFactory
-from llmin.observability import InMemoryTraceSink
+from llmin.memory import (
+    AttemptCoordinator,
+    ContentAddressedArtifactStore,
+    EnvironmentProbe,
+    SQLiteMemoryStore,
+)
 from llmin.orchestrator import TaskState
 from llmin.pipeline import Pipeline
 from llmin.planning import FakePlanner
@@ -73,7 +79,10 @@ def run_fixture(
         typer.echo(f"invalid fixture: {error}", err=True)
         raise typer.Exit(code=2) from error
 
-    sink = InMemoryTraceSink()
+    memory_root = base_root / ".llmin"
+    memory_root.mkdir(exist_ok=True)
+    sink = SQLiteMemoryStore(memory_root / "memory.sqlite3")
+    artifacts = ContentAddressedArtifactStore(memory_root / "artifacts")
     sandbox_factory = SandboxFactory(base_root)
     executor = Executor(
         CapabilityRegistry.with_builtins(),
@@ -91,9 +100,17 @@ def run_fixture(
         verification=verification,
         trace_sink=sink,
     )
-    result = pipeline.run(task)
+    coordinated = AttemptCoordinator(memory=sink, artifacts=artifacts).run(
+        pipeline=pipeline,
+        task=task,
+        environment_attributes=EnvironmentProbe().capture(),
+    )
+    result = coordinated.result
+    events = sink.reconstruct_attempt(result.attempt_id).trace_events
     summary = {
         "task_id": str(task.task_id),
+        "attempt_id": str(result.attempt_id),
+        "trace_id": str(result.trace_id),
         "final_state": result.final_state.value,
         "execution_success": (
             result.execution_report.success if result.execution_report is not None else None
@@ -103,11 +120,68 @@ def run_fixture(
             if result.verification_report is not None
             else None
         ),
-        "trace_events": len(sink.events),
+        "trace_events": len(events),
     }
     typer.echo(json.dumps(summary, ensure_ascii=False, sort_keys=True))
     if result.final_state is not TaskState.COMPLETED:
         raise typer.Exit(code=1)
+
+
+@app.command("show-attempt")
+def show_attempt(
+    database_file: Annotated[
+        Path,
+        typer.Argument(exists=True, file_okay=True, dir_okay=False, readable=True),
+    ],
+    attempt_id: Annotated[UUID, typer.Argument()],
+) -> None:
+    """Read a persisted attempt status, result, and trace summary by ID."""
+
+    sink = SQLiteMemoryStore(database_file)
+    attempt = sink.get_attempt(attempt_id)
+    if attempt is None:
+        typer.echo(f"attempt not found: {attempt_id}", err=True)
+        raise typer.Exit(code=1)
+
+    memory = sink.reconstruct_attempt(attempt_id)
+    execution = attempt.execution_report
+    verification = attempt.verification_report
+    state_sequence = ["received"]
+    state_sequence.extend(
+        str(event.payload["to_state"])
+        for event in memory.trace_events
+        if event.event_type == "orchestrator.transition" and "to_state" in event.payload
+    )
+    diagnostics = [
+        {
+            "event_type": event.event_type,
+            "payload": dict(event.payload),
+        }
+        for event in memory.trace_events
+        if event.event_type.endswith((".failed", ".rejected"))
+        or (
+            event.event_type == "orchestrator.transition"
+            and event.payload.get("to_state") == "failed"
+        )
+    ]
+    summary = {
+        "attempt_id": str(attempt.attempt_id),
+        "trace_id": str(attempt.trace_id),
+        "task_id": str(attempt.task.task_id),
+        "objective": attempt.task.objective,
+        "status": attempt.status.value,
+        "final_state": attempt.final_state.value if attempt.final_state is not None else None,
+        "planner_kind": attempt.plan.planner_kind.value if attempt.plan is not None else None,
+        "execution_success": execution.success if execution is not None else None,
+        "execution_error": execution.error if execution is not None else None,
+        "verification_verdict": verification.verdict.value if verification is not None else None,
+        "verification_errors": list(verification.errors) if verification is not None else [],
+        "diagnostics": diagnostics,
+        "state_sequence": state_sequence,
+        "trace_events": len(memory.trace_events),
+        "evidence": [item.model_dump(mode="json") for item in memory.evidence],
+    }
+    typer.echo(json.dumps(summary, ensure_ascii=False, sort_keys=True))
 
 
 @app.command("benchmark")

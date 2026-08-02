@@ -1,7 +1,65 @@
-# Memory v0
+# Governed Memory
 
-Memory v0 implements the first executable boundary from manifesto 0.4. It deliberately
-separates an append-only evidence journal from governed memory objects.
+The memory subsystem implements the first executable boundary from manifesto 0.4. It
+deliberately separates an append-only evidence journal, complete execution attempts, and
+governed memory objects.
+
+## Complete attempts
+
+Every `PipelineResult`, including failures before execution, exposes the pipeline `task_id`,
+`trace_id`, `attempt_id`, and the execution plan when one exists. `AttemptRecorder` rejects a
+result whose task differs from the supplied `TaskSpec` and turns a matching result into
+an `AttemptRecord` containing:
+
+- the complete redacted `TaskSpec`;
+- the plan, execution report, and independent verification report when produced;
+- a content-derived `EnvironmentRecord`;
+- the terminal pipeline state;
+- immutable references to persisted artifacts.
+
+Recording has two explicit phases. `begin_attempt()` creates an `open` record, and
+`finalize_attempt()` atomically commits terminal trace transitions, terminal metadata, verifier
+evidence, and a `RecordingReceipt` in one SQLite
+transaction. `AttemptCoordinator` is the normal pre-run boundary: it creates the open record,
+passes its fixed `trace_id` and `attempt_id` to `Pipeline`, then finalizes that same record. The
+store requires a complete, identity-consistent lifecycle journal and creates `recorded` and
+`completed` inside the finalization transaction. A successful direct `Pipeline.run()` stops at
+`verified`; no public callback can promote it. Failed persistence therefore rolls back terminal
+events and leaves the attempt open. A
+crash before a `PipelineResult` leaves the open record for diagnosis instead of creating a
+trace-only execution. Repeating either persistence operation with identical content is
+idempotent, including direct `begin_attempt()` retries that do not supply a timestamp. Reusing
+an identifier for different content is rejected. SQLite identity comparisons use a canonical
+JSON encoding that sorts only unordered set-like fields; declared list and tuple order remains
+meaningful.
+
+An attempt marked `completed` is valid only when execution succeeded and independent
+verification passed. Cross-task, cross-plan, and cross-attempt report references are rejected
+before persistence. If finalization fails, SQLite rolls back evidence and leaves the attempt
+open rather than presenting a partial record as complete.
+
+Output artifacts are collected only after execution and successful verification through an
+`ArtifactCollector`. The coordinator does not accept pre-execution output bytes. An existing
+open attempt cannot be executed again; recovery and persistence retry are separate operations.
+
+CLI and benchmark runs use the same `EnvironmentProbe`. Its fingerprint includes OS,
+architecture, Python and dependency versions, LLMIN revision, capability/verifier versions,
+contract encoding, and supported formats. Workspace paths and task/case identifiers are excluded
+so compatibility identity is portable across equivalent runs.
+
+## Artifact store
+
+`ContentAddressedArtifactStore` stores redacted UTF-8 artifacts under their SHA-256 digest.
+Writes use a temporary file, flush, filesystem sync, atomic replacement, and verification of
+both existing and newly read content. A digest collision with different content or later
+tampering is rejected.
+
+Stage 1 accepts only `text/plain`, `application/json`, and `application/toml`; JSON and TOML are
+parsed before storage and recursively checked for sensitive keys. Content rejected by the
+existing secret-redaction boundary is not stored.
+The store enforces per-blob and total-size quotas, validates logical names, and rejects symlink,
+junction, and other reparse-point components below its trusted root. Binary artifacts and
+media-specific sanitizers are deliberately deferred.
 
 ## Evidence journal
 
@@ -15,9 +73,11 @@ Identifiers are immutable. Repeating the same record is idempotent; reusing an i
 with different content is rejected. `reconstruct_attempt()` returns events in insertion order
 and does not turn them into an episode automatically.
 
-SQLite schema version is checked on every open. Free-form payloads cross the existing
-redaction boundary before SQL execution, foreign keys are enabled, and secure deletion is
-requested from SQLite. The adapter opens and closes a connection per atomic operation.
+SQLite schema version is checked and migrated on every open. Schema v4 identifies canonical JSON
+document encoding and adds durable recording receipts; older document rows are model-validated
+and rewritten canonically during migration. Free-form payloads cross the existing redaction
+boundary before SQL execution, foreign keys are enabled, and secure deletion is requested from
+SQLite. The adapter opens and closes a connection per atomic operation.
 
 ## Episodes
 
@@ -25,7 +85,8 @@ An episode is a selected, reproducible description of one attempt. It requires:
 
 - existing trace and evidence provenance from the same task/attempt;
 - a content hash calculated after redaction;
-- an environment fingerprint;
+- at least one environment fingerprint; when the source attempt is persisted, its fingerprint
+  must be included;
 - an explicit retention policy;
 - a non-empty summary while payload is active.
 
@@ -50,6 +111,9 @@ content hash, provenance, applicability, retention, and creation time. An artifa
 claim with evidence, not a database row that is automatically true.
 
 `Provenance` links source trace events, verifier evidence, verification reports, and parent artifacts.
+When report provenance is declared, its IDs must resolve to the source attempt and referenced
+evidence must belong to that report; parent episode IDs must already exist. A general artifact
+registry is still deferred, so this increment validates persisted episode parents only.
 `Applicability` describes family, structured scope, compatible environments, preconditions,
 exclusions, and required capabilities. An empty environment set means «not yet constrained by
 an environment fingerprint», not «compatible with every future environment».
@@ -58,17 +122,32 @@ an environment fingerprint», not «compatible with every future environment».
 does not introduce a competing verifier truth model.
 
 `ArtifactRelation` records typed graph edges without requiring a graph database. SQLite remains
-the source of truth. Memory v0 persists relations between episode artifacts; generic Rule and
-Experiment persistence follows in M2. `ContradictionRecord` preserves unresolved conflicts
+the source of truth. The current increment persists relations between episode artifacts; generic
+Rule and Experiment persistence follows in a later increment. `ContradictionRecord` preserves unresolved conflicts
 rather than replacing one artifact with another. A resolution is a new immutable record that
 supersedes the open investigation, so the conflict history cannot be overwritten.
 
-`ExperimentArtifact` preserves hypotheses and negative results. Its contract exists in Memory
-v0, while automatic experiment generation and routing are deferred.
+`ExperimentArtifact` preserves hypotheses and negative results. Its contract exists, while
+automatic experiment generation and routing are deferred.
+
+## Recovery boundary
+
+The coordinator makes finalized attempt metadata internally atomic and creates the attempt
+before a coordinated pipeline run. It is still not a complete recovery system:
+
+- callers can invoke `Pipeline.run()` directly, but such a run stops at `verified` and is not a
+  durably completed attempt;
+- an operating-system crash can still interrupt an open attempt and requires reconciliation;
+- a failed database finalization may leave an unreferenced immutable CAS blob;
+- garbage collection and reconciliation of trace-only attempts or unreferenced blobs are not
+  implemented yet.
+
+The next recovery increment should add startup reconciliation and conservative reference-based
+garbage collection.
 
 ## Explicit non-goals
 
-Memory v0 does not yet:
+The memory subsystem does not yet:
 
 - promote episodes to semantic or procedural knowledge;
 - persist or route Rule/Experiment artifacts;
@@ -79,6 +158,9 @@ Memory v0 does not yet:
 - make age-only deletion decisions;
 - implement similarity or vector search;
 - load episodes into Context Compiler;
+- sanitize or store binary artifacts;
+- reconcile process crashes across pipeline, SQLite, and the artifact store;
+- garbage-collect unreferenced content-addressed blobs;
 - claim cryptographic erasure of storage-device remnants.
 
 Those capabilities require separate policy, evaluation, and threat-model increments.

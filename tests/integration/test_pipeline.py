@@ -59,7 +59,7 @@ def load_benchmark(tmp_path: Path) -> tuple[TaskSpec, ExecutionPlan, Path]:
     return task, plan, workspace
 
 
-def test_fixture_reaches_completed_only_after_independent_verification(
+def test_fixture_stops_at_verified_without_a_recording_gate(
     tmp_path: Path,
 ) -> None:
     task, plan, workspace = load_benchmark(tmp_path)
@@ -67,7 +67,7 @@ def test_fixture_reaches_completed_only_after_independent_verification(
 
     result = pipeline.run(task)
 
-    assert result.final_state is TaskState.COMPLETED
+    assert result.final_state is TaskState.VERIFIED
     assert result.execution_report is not None and result.execution_report.success
     assert result.verification_report is not None
     assert result.verification_report.verdict is VerificationVerdict.PASSED
@@ -83,6 +83,11 @@ def test_fixture_reaches_completed_only_after_independent_verification(
         event for event in sink.events if event.event_type == "verification.completed"
     )
     assert sink.events.index(verification_event) < sink.events.index(verified_transition)
+    assert not any(
+        event.event_type == "orchestrator.transition"
+        and event.payload["to_state"] in {"recorded", "completed"}
+        for event in sink.events
+    )
 
 
 def test_wrong_output_never_reaches_verified_state(tmp_path: Path) -> None:
@@ -172,4 +177,6 @@ def test_incompatible_capability_fails_before_execution(tmp_path: Path) -> None:
     assert result.final_state is TaskState.FAILED
     assert result.execution_report is None
     assert result.verification_report is None
+    assert sink.events[-2].event_type == "authorization.failed"
+    assert sink.events[-2].payload["reason"] == "capability is not registered: unknown_capability"
     assert json.loads(sink.events[-1].model_dump_json())["payload"]["to_state"] == "failed"

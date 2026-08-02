@@ -216,6 +216,14 @@ def test_episode_contract_requires_provenance() -> None:
         Episode.model_validate(payload)
 
 
+def test_episode_contract_requires_environment_fingerprint() -> None:
+    payload = make_episode(minimum_retain_until=datetime.now(UTC)).model_dump()
+    payload["applicability"] = {**payload["applicability"], "environment_fingerprints": []}
+
+    with pytest.raises(ValidationError, match="environment fingerprint"):
+        Episode.model_validate(payload)
+
+
 def test_rule_and_rejected_experiment_preserve_applicability_and_negative_result() -> None:
     episode = make_episode(minimum_retain_until=datetime.now(UTC))
     provenance = Provenance(parent_artifact_ids=frozenset({episode.artifact_id}))
@@ -319,6 +327,32 @@ def test_episode_creation_rejects_missing_or_mismatched_provenance(tmp_path: Pat
     persist_episode_provenance(store, episode)
     with pytest.raises(MemoryStoreError, match="another task or attempt"):
         store.create_episode(wrong_task)
+
+
+def test_episode_creation_rejects_unknown_parent_and_report_provenance(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    episode = make_episode(minimum_retain_until=datetime.now(UTC))
+    persist_episode_provenance(store, episode)
+
+    unknown_parent = episode.model_copy(
+        update={
+            "provenance": episode.provenance.model_copy(
+                update={"parent_artifact_ids": frozenset({uuid4()})}
+            )
+        }
+    )
+    with pytest.raises(MemoryStoreError, match="unknown parent artifact"):
+        store.create_episode(unknown_parent)
+
+    unknown_report = episode.model_copy(
+        update={
+            "provenance": episode.provenance.model_copy(
+                update={"verification_report_ids": frozenset({uuid4()})}
+            )
+        }
+    )
+    with pytest.raises(MemoryStoreError, match="requires a persisted attempt"):
+        store.create_episode(unknown_report)
 
 
 def test_unknown_schema_version_is_rejected(tmp_path: Path) -> None:

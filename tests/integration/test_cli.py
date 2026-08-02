@@ -1,10 +1,12 @@
 import json
 import shutil
 from pathlib import Path
+from uuid import UUID, uuid4
 
 from typer.testing import CliRunner
 
 from llmin.cli import app
+from llmin.memory import SQLiteMemoryStore
 
 runner = CliRunner()
 
@@ -29,6 +31,39 @@ def test_validate_task_rejects_unknown_fields(tmp_path) -> None:
     assert "invalid:" in result.stderr
 
 
+def test_validate_task_rejects_empty_request(tmp_path: Path) -> None:
+    fixture = tmp_path / "empty.json"
+    fixture.write_text("", encoding="utf-8")
+
+    result = runner.invoke(app, ["validate-task", str(fixture)])
+
+    assert result.exit_code == 2
+    assert "invalid:" in result.stderr
+
+
+def test_validate_task_rejects_malformed_json(tmp_path: Path) -> None:
+    fixture = tmp_path / "malformed.json"
+    fixture.write_text("{", encoding="utf-8")
+
+    result = runner.invoke(app, ["validate-task", str(fixture)])
+
+    assert result.exit_code == 2
+    assert "invalid:" in result.stderr
+
+
+def test_validate_task_rejects_missing_required_parameter(tmp_path: Path) -> None:
+    fixture = tmp_path / "missing-objective.json"
+    fixture.write_text(
+        '{"family":"config_patch","workspace":"sandbox/task","postconditions":[]}',
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["validate-task", str(fixture)])
+
+    assert result.exit_code == 2
+    assert "objective" in result.stderr
+
+
 def test_run_fixture_reaches_verified_terminal_state(tmp_path: Path) -> None:
     task_file = Path("benchmarks/tasks/config_patch/001.json")
     plan_file = Path("benchmarks/plans/config_patch/001.json")
@@ -43,10 +78,50 @@ def test_run_fixture_reaches_verified_terminal_state(tmp_path: Path) -> None:
 
     assert result.exit_code == 0
     summary = json.loads(result.stdout)
+    UUID(summary["attempt_id"])
+    UUID(summary["trace_id"])
     assert summary["final_state"] == "completed"
     assert summary["execution_success"] is True
     assert summary["verification_verdict"] == "passed"
     assert summary["trace_events"] > 0
+
+    persisted = runner.invoke(
+        app,
+        ["show-attempt", str(tmp_path / ".llmin" / "memory.sqlite3"), summary["attempt_id"]],
+    )
+
+    assert persisted.exit_code == 0
+    persisted_summary = json.loads(persisted.stdout)
+    assert persisted_summary["attempt_id"] == summary["attempt_id"]
+    assert persisted_summary["trace_id"] == summary["trace_id"]
+    assert persisted_summary["status"] == "finalized"
+    assert persisted_summary["final_state"] == "completed"
+    assert persisted_summary["planner_kind"] == "fake"
+    assert persisted_summary["execution_success"] is True
+    assert persisted_summary["verification_verdict"] == "passed"
+    assert persisted_summary["diagnostics"] == []
+    assert persisted_summary["state_sequence"] == [
+        "received",
+        "routed",
+        "planned",
+        "authorized",
+        "executed",
+        "verified",
+        "recorded",
+        "completed",
+    ]
+    assert persisted_summary["trace_events"] == summary["trace_events"]
+    assert len(persisted_summary["evidence"]) == 1
+
+
+def test_show_attempt_reports_unknown_id(tmp_path: Path) -> None:
+    database = tmp_path / "memory.sqlite3"
+    SQLiteMemoryStore(database)
+
+    result = runner.invoke(app, ["show-attempt", str(database), str(uuid4())])
+
+    assert result.exit_code == 1
+    assert "attempt not found:" in result.stderr
 
 
 def test_benchmark_command_writes_passing_report(tmp_path: Path) -> None:

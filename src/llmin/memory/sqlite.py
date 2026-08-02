@@ -8,23 +8,32 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
-from llmin.domain import Evidence
+from llmin.domain import Evidence, ExecutionPlan, TaskSpec, VerificationReport
+from llmin.domain.json_types import canonical_json, canonical_sha256
+from llmin.execution import ExecutionReport
 from llmin.memory.models import (
+    ArtifactBlob,
     ArtifactRelation,
     AttemptMemory,
+    AttemptRecord,
+    AttemptStatus,
     ContradictionRecord,
     ContradictionStatus,
     CostEntry,
+    EnvironmentRecord,
     Episode,
     EpisodeTransition,
     MemoryState,
+    RecordingReceipt,
     artifact_content_hash,
 )
 from llmin.observability import TraceEvent, redact
+from llmin.orchestrator import TaskState
+from llmin.orchestrator.state_machine import ALLOWED_TRANSITIONS
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 4
 _ALLOWED_TRANSITIONS = {
     MemoryState.ACTIVE: frozenset(
         {MemoryState.COLD, MemoryState.QUARANTINED, MemoryState.TOMBSTONED}
@@ -54,25 +63,9 @@ class SQLiteMemoryStore:
         sanitized = TraceEvent.model_validate(
             {**event.model_dump(), "payload": redact(event.payload)}
         )
-        document = sanitized.model_dump_json()
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            existing = connection.execute(
-                "SELECT document FROM trace_events WHERE event_id = ?",
-                (str(sanitized.event_id),),
-            ).fetchone()
-            if existing is not None:
-                self._require_identical(existing[0], document, "trace event")
-                return
-            sequence = connection.execute(
-                "SELECT COALESCE(MAX(sequence), 0) + 1 FROM trace_events WHERE attempt_id = ?",
-                (str(sanitized.attempt_id),),
-            ).fetchone()[0]
-            connection.execute(
-                "INSERT INTO trace_events(event_id, attempt_id, sequence, document) "
-                "VALUES (?, ?, ?, ?)",
-                (str(sanitized.event_id), str(sanitized.attempt_id), sequence, document),
-            )
+            self._insert_trace(connection, sanitized)
 
     def emit(self, event: TraceEvent) -> None:
         """Implement TraceSink so pipelines can persist events at the redaction boundary."""
@@ -81,7 +74,7 @@ class SQLiteMemoryStore:
 
     def append_evidence(self, attempt_id: UUID, evidence: Evidence) -> None:
         sanitized = Evidence.model_validate(redact(evidence.model_dump()))
-        document = sanitized.model_dump_json()
+        document = canonical_json(sanitized)
         self._insert_immutable(
             table="evidence",
             identifier_column="evidence_id",
@@ -100,7 +93,7 @@ class SQLiteMemoryStore:
             identifier_column="cost_id",
             identifier=str(sanitized.cost_id),
             attempt_id=sanitized.attempt_id,
-            document=sanitized.model_dump_json(),
+            document=canonical_json(sanitized),
             kind="cost entry",
         )
 
@@ -125,6 +118,167 @@ class SQLiteMemoryStore:
             costs=tuple(CostEntry.model_validate_json(row[0]) for row in cost_rows),
         )
 
+    def begin_attempt(
+        self,
+        *,
+        attempt_id: UUID,
+        trace_id: UUID,
+        task: TaskSpec,
+        plan: ExecutionPlan | None = None,
+        environment: EnvironmentRecord,
+        created_at: datetime | None = None,
+    ) -> AttemptRecord:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT document FROM attempts WHERE attempt_id = ?",
+                (str(attempt_id),),
+            ).fetchone()
+            if existing is not None:
+                current = AttemptRecord.model_validate_json(existing[0])
+                self._require_attempt_envelope(
+                    current,
+                    trace_id=trace_id,
+                    task=task,
+                    plan=plan,
+                    environment=environment,
+                )
+                return current
+            record = AttemptRecord(
+                attempt_id=attempt_id,
+                trace_id=trace_id,
+                task=task,
+                plan=plan,
+                environment=environment,
+                created_at=created_at or datetime.now(UTC),
+            )
+            sanitized = AttemptRecord.model_validate(redact(record.model_dump()))
+            self._validate_existing_trace_identity(connection, sanitized)
+            self._insert_environment(connection, sanitized.environment)
+            document = canonical_json(sanitized)
+            connection.execute(
+                "INSERT INTO attempts(attempt_id, status, document) VALUES (?, ?, ?)",
+                (str(attempt_id), sanitized.status.value, document),
+            )
+        return sanitized
+
+    def finalize_attempt(
+        self,
+        attempt_id: UUID,
+        *,
+        plan: ExecutionPlan | None = None,
+        final_state: TaskState,
+        execution_report: ExecutionReport | None,
+        verification_report: VerificationReport | None,
+        artifacts: tuple[ArtifactBlob, ...] = (),
+        finalized_at: datetime | None = None,
+    ) -> AttemptRecord:
+        record, _receipt = self.finalize_attempt_with_receipt(
+            attempt_id,
+            plan=plan,
+            final_state=final_state,
+            execution_report=execution_report,
+            verification_report=verification_report,
+            artifacts=artifacts,
+            finalized_at=finalized_at,
+        )
+        return record
+
+    def finalize_attempt_with_receipt(
+        self,
+        attempt_id: UUID,
+        *,
+        plan: ExecutionPlan | None = None,
+        final_state: TaskState,
+        execution_report: ExecutionReport | None,
+        verification_report: VerificationReport | None,
+        artifacts: tuple[ArtifactBlob, ...] = (),
+        finalized_at: datetime | None = None,
+    ) -> tuple[AttemptRecord, RecordingReceipt]:
+        """Atomically commit terminal trace transitions, evidence, attempt, and receipt."""
+
+        timestamp = finalized_at or datetime.now(UTC)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT document FROM attempts WHERE attempt_id = ?",
+                (str(attempt_id),),
+            ).fetchone()
+            if row is None:
+                raise MemoryStoreError("attempt does not exist")
+            current = AttemptRecord.model_validate_json(row[0])
+            if current.plan is not None and plan is not None and current.plan != plan:
+                raise MemoryStoreError("attempt plan was changed during finalization")
+            effective_finalized_at = (
+                current.finalized_at if current.status is AttemptStatus.FINALIZED else timestamp
+            )
+            candidate = AttemptRecord.model_validate(
+                redact(
+                    current.model_copy(
+                        update={
+                            "status": AttemptStatus.FINALIZED,
+                            "plan": current.plan or plan,
+                            "final_state": final_state,
+                            "execution_report": execution_report,
+                            "verification_report": verification_report,
+                            "artifacts": artifacts,
+                            "finalized_at": effective_finalized_at,
+                        }
+                    ).model_dump()
+                )
+            )
+            self._validate_existing_trace_identity(connection, candidate)
+            document = canonical_json(candidate)
+            if current.status is AttemptStatus.FINALIZED:
+                self._require_identical(row[0], document, "finalized attempt")
+                receipt = self._read_recording_receipt(connection, current.attempt_id)
+                if receipt is None:
+                    raise MemoryStoreError("finalized attempt has no recording receipt")
+                return current, receipt
+
+            if candidate.final_state is TaskState.COMPLETED:
+                self._append_terminal_completion_events(connection, candidate)
+            self._validate_lifecycle_trace(connection, candidate)
+            if verification_report is not None:
+                persisted_verification = candidate.verification_report
+                if persisted_verification is None:
+                    raise MemoryStoreError("verification report was lost during sanitization")
+                for evidence in persisted_verification.evidence:
+                    self._insert_evidence(connection, candidate.attempt_id, evidence)
+            connection.execute(
+                "UPDATE attempts SET status = ?, document = ? WHERE attempt_id = ?",
+                (AttemptStatus.FINALIZED.value, document, str(attempt_id)),
+            )
+            receipt = RecordingReceipt(
+                attempt_id=candidate.attempt_id,
+                trace_id=candidate.trace_id,
+                task_id=candidate.task.task_id,
+                document_hash=canonical_sha256(candidate),
+                storage_transaction_id=uuid4(),
+            )
+            connection.execute(
+                "INSERT INTO recording_receipts(attempt_id, transaction_id, document) "
+                "VALUES (?, ?, ?)",
+                (
+                    str(candidate.attempt_id),
+                    str(receipt.storage_transaction_id),
+                    canonical_json(receipt),
+                ),
+            )
+        return candidate, receipt
+
+    def get_attempt(self, attempt_id: UUID) -> AttemptRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT document FROM attempts WHERE attempt_id = ?",
+                (str(attempt_id),),
+            ).fetchone()
+        return AttemptRecord.model_validate_json(row[0]) if row is not None else None
+
+    def get_recording_receipt(self, attempt_id: UUID) -> RecordingReceipt | None:
+        with self._connect() as connection:
+            return self._read_recording_receipt(connection, attempt_id)
+
     def create_episode(self, episode: Episode) -> None:
         if episode.state is not MemoryState.ACTIVE:
             raise MemoryStoreError("new episodes must start active")
@@ -133,7 +287,7 @@ class SQLiteMemoryStore:
             sanitized.summary
         ):
             raise MemoryStoreError("episode content hash does not match sanitized payload")
-        document = sanitized.model_dump_json()
+        document = canonical_json(sanitized)
         with self._connect() as connection:
             existing = connection.execute(
                 "SELECT document FROM episodes WHERE episode_id = ?",
@@ -160,7 +314,7 @@ class SQLiteMemoryStore:
                 table="artifact_relations",
                 identifier_column="relation_id",
                 identifier=sanitized.relation_id,
-                document=sanitized.model_dump_json(),
+                document=canonical_json(sanitized),
                 kind="artifact relation",
             )
 
@@ -185,7 +339,7 @@ class SQLiteMemoryStore:
                 table="contradictions",
                 identifier_column="contradiction_id",
                 identifier=sanitized.contradiction_id,
-                document=sanitized.model_dump_json(),
+                document=canonical_json(sanitized),
                 kind="contradiction",
             )
 
@@ -253,7 +407,7 @@ class SQLiteMemoryStore:
             )
             connection.execute(
                 "UPDATE episodes SET state = ?, document = ? WHERE episode_id = ?",
-                (target.value, updated.model_dump_json(), str(episode_id)),
+                (target.value, canonical_json(updated), str(episode_id)),
             )
             connection.execute(
                 "INSERT INTO episode_transitions(transition_id, episode_id, document) "
@@ -261,7 +415,7 @@ class SQLiteMemoryStore:
                 (
                     str(transition.transition_id),
                     str(episode_id),
-                    transition.model_dump_json(),
+                    canonical_json(transition),
                 ),
             )
         return transition
@@ -300,6 +454,40 @@ class SQLiteMemoryStore:
                 raise MemoryStoreError("episode references unknown evidence")
             if row[0] != str(episode.attempt_id):
                 raise MemoryStoreError("episode evidence belongs to another attempt")
+        attempt_row = connection.execute(
+            "SELECT document FROM attempts WHERE attempt_id = ?",
+            (str(episode.attempt_id),),
+        ).fetchone()
+        if episode.provenance.verification_report_ids:
+            if attempt_row is None:
+                raise MemoryStoreError("episode report provenance requires a persisted attempt")
+            attempt = AttemptRecord.model_validate_json(attempt_row[0])
+            report = attempt.verification_report
+            if report is None or report.task_id != episode.task_id:
+                raise MemoryStoreError(
+                    "episode report provenance belongs to another task or attempt"
+                )
+            if set(episode.provenance.verification_report_ids) != {report.report_id}:
+                raise MemoryStoreError("episode references an unknown verification report")
+            evidence_ids = {evidence.evidence_id for evidence in report.evidence}
+            if not episode.provenance.evidence_ids.issubset(evidence_ids):
+                raise MemoryStoreError("episode evidence is absent from its verification report")
+        if attempt_row is not None:
+            attempt = AttemptRecord.model_validate_json(attempt_row[0])
+            if attempt.task.task_id != episode.task_id:
+                raise MemoryStoreError("episode attempt provenance belongs to another task")
+            if (
+                attempt.environment.fingerprint
+                not in episode.applicability.environment_fingerprints
+            ):
+                raise MemoryStoreError("episode applicability omits its source environment")
+        for parent_id in episode.provenance.parent_artifact_ids:
+            row = connection.execute(
+                "SELECT 1 FROM episodes WHERE episode_id = ?",
+                (str(parent_id),),
+            ).fetchone()
+            if row is None:
+                raise MemoryStoreError("episode references an unknown parent artifact")
 
     @staticmethod
     def _require_artifacts_exist(
@@ -363,9 +551,229 @@ class SQLiteMemoryStore:
                 (identifier, str(attempt_id), document),
             )
 
+    def _insert_evidence(
+        self,
+        connection: sqlite3.Connection,
+        attempt_id: UUID,
+        evidence: Evidence,
+    ) -> None:
+        document = canonical_json(evidence)
+        existing = connection.execute(
+            "SELECT document, attempt_id FROM evidence WHERE evidence_id = ?",
+            (str(evidence.evidence_id),),
+        ).fetchone()
+        if existing is not None:
+            if existing[1] != str(attempt_id):
+                raise MemoryStoreError("evidence identifier belongs to another attempt")
+            self._require_identical(existing[0], document, "evidence")
+            return
+        connection.execute(
+            "INSERT INTO evidence(evidence_id, attempt_id, document) VALUES (?, ?, ?)",
+            (str(evidence.evidence_id), str(attempt_id), document),
+        )
+
+    def _insert_trace(
+        self,
+        connection: sqlite3.Connection,
+        event: TraceEvent,
+    ) -> None:
+        document = canonical_json(event)
+        existing = connection.execute(
+            "SELECT document FROM trace_events WHERE event_id = ?",
+            (str(event.event_id),),
+        ).fetchone()
+        if existing is not None:
+            self._require_identical(existing[0], document, "trace event")
+            return
+        sequence = connection.execute(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM trace_events WHERE attempt_id = ?",
+            (str(event.attempt_id),),
+        ).fetchone()[0]
+        connection.execute(
+            "INSERT INTO trace_events(event_id, attempt_id, sequence, document) "
+            "VALUES (?, ?, ?, ?)",
+            (str(event.event_id), str(event.attempt_id), sequence, document),
+        )
+
+    def _append_terminal_completion_events(
+        self,
+        connection: sqlite3.Connection,
+        attempt: AttemptRecord,
+    ) -> None:
+        rows = connection.execute(
+            "SELECT document FROM trace_events WHERE attempt_id = ? ORDER BY sequence",
+            (str(attempt.attempt_id),),
+        ).fetchall()
+        events = [TraceEvent.model_validate_json(row[0]) for row in rows]
+        transitions = [event for event in events if event.event_type == "orchestrator.transition"]
+        if not events or not transitions:
+            raise MemoryStoreError("completed attempt requires a persisted lifecycle trace")
+        last = transitions[-1]
+        if last is not events[-1] or last.payload.get("to_state") != TaskState.VERIFIED.value:
+            raise MemoryStoreError("completed attempt trace must end at verified")
+        try:
+            next_sequence = int(last.payload["sequence"]) + 1
+        except (KeyError, TypeError, ValueError) as error:
+            raise MemoryStoreError("lifecycle transition has an invalid sequence") from error
+
+        recorded = TraceEvent(
+            trace_id=attempt.trace_id,
+            task_id=attempt.task.task_id,
+            attempt_id=attempt.attempt_id,
+            event_type="orchestrator.transition",
+            payload={
+                "sequence": next_sequence,
+                "from_state": TaskState.VERIFIED.value,
+                "to_state": TaskState.RECORDED.value,
+                "reason": "attempt and verification evidence durably recorded",
+            },
+        )
+        completed = TraceEvent(
+            trace_id=attempt.trace_id,
+            task_id=attempt.task.task_id,
+            attempt_id=attempt.attempt_id,
+            event_type="orchestrator.transition",
+            payload={
+                "sequence": next_sequence + 1,
+                "from_state": TaskState.RECORDED.value,
+                "to_state": TaskState.COMPLETED.value,
+                "reason": "terminal lifecycle committed atomically",
+            },
+        )
+        self._insert_trace(connection, recorded)
+        self._insert_trace(connection, completed)
+
+    @staticmethod
+    def _validate_lifecycle_trace(
+        connection: sqlite3.Connection,
+        attempt: AttemptRecord,
+    ) -> None:
+        rows = connection.execute(
+            "SELECT document FROM trace_events WHERE attempt_id = ? ORDER BY sequence",
+            (str(attempt.attempt_id),),
+        ).fetchall()
+        events = [TraceEvent.model_validate_json(row[0]) for row in rows]
+        if not events:
+            raise MemoryStoreError("finalized attempt requires a non-empty lifecycle trace")
+        if any(
+            event.task_id != attempt.task.task_id
+            or event.trace_id != attempt.trace_id
+            or event.attempt_id != attempt.attempt_id
+            for event in events
+        ):
+            raise MemoryStoreError("attempt trace belongs to another task, trace, or attempt")
+
+        current = TaskState.RECEIVED
+        transition_count = 0
+        verified_event_index: int | None = None
+        terminal_event_index: int | None = None
+        for event_index, event in enumerate(events):
+            if event.event_type != "orchestrator.transition":
+                continue
+            transition_count += 1
+            try:
+                sequence = int(event.payload["sequence"])
+                source = TaskState(str(event.payload["from_state"]))
+                target = TaskState(str(event.payload["to_state"]))
+            except (KeyError, TypeError, ValueError) as error:
+                raise MemoryStoreError("lifecycle transition payload is invalid") from error
+            if sequence != transition_count:
+                raise MemoryStoreError("lifecycle transition sequence is not contiguous")
+            if source is not current or target not in ALLOWED_TRANSITIONS[current]:
+                raise MemoryStoreError("lifecycle trace contains an invalid state transition")
+            current = target
+            if target is TaskState.VERIFIED:
+                verified_event_index = event_index
+            if target in {TaskState.COMPLETED, TaskState.FAILED, TaskState.ESCALATED}:
+                terminal_event_index = event_index
+                if event_index != len(events) - 1:
+                    raise MemoryStoreError("lifecycle trace contains events after terminal state")
+
+        if transition_count == 0 or current is not attempt.final_state:
+            raise MemoryStoreError("lifecycle trace terminal state does not match attempt")
+        if terminal_event_index is None:
+            raise MemoryStoreError("finalized attempt trace has no terminal transition")
+        if attempt.final_state is TaskState.COMPLETED:
+            if verified_event_index is None or attempt.verification_report is None:
+                raise MemoryStoreError("completed attempt trace has no verified checkpoint")
+            verification_indexes = [
+                index
+                for index, event in enumerate(events)
+                if event.event_type == "verification.completed"
+                and event.payload.get("report_id") == str(attempt.verification_report.report_id)
+            ]
+            if not verification_indexes or verification_indexes[-1] >= verified_event_index:
+                raise MemoryStoreError(
+                    "verification.completed must precede the verified transition"
+                )
+
+    @staticmethod
+    def _read_recording_receipt(
+        connection: sqlite3.Connection,
+        attempt_id: UUID,
+    ) -> RecordingReceipt | None:
+        row = connection.execute(
+            "SELECT document FROM recording_receipts WHERE attempt_id = ?",
+            (str(attempt_id),),
+        ).fetchone()
+        return RecordingReceipt.model_validate_json(row[0]) if row is not None else None
+
+    @staticmethod
+    def _insert_environment(
+        connection: sqlite3.Connection,
+        environment: EnvironmentRecord,
+    ) -> None:
+        document = canonical_json(environment)
+        existing = connection.execute(
+            "SELECT document FROM environments WHERE fingerprint = ?",
+            (environment.fingerprint,),
+        ).fetchone()
+        if existing is not None and canonical_json(json.loads(existing[0])) != document:
+            raise MemoryStoreError("environment fingerprint was reused with new content")
+        if existing is None:
+            connection.execute(
+                "INSERT INTO environments(fingerprint, document) VALUES (?, ?)",
+                (environment.fingerprint, document),
+            )
+
+    @staticmethod
+    def _require_attempt_envelope(
+        existing: AttemptRecord,
+        *,
+        trace_id: UUID,
+        task: TaskSpec,
+        plan: ExecutionPlan | None,
+        environment: EnvironmentRecord,
+    ) -> None:
+        sanitized_task = TaskSpec.model_validate(redact(task.model_dump()))
+        sanitized_plan = (
+            ExecutionPlan.model_validate(redact(plan.model_dump())) if plan is not None else None
+        )
+        if (
+            existing.trace_id != trace_id
+            or existing.task != sanitized_task
+            or existing.plan != sanitized_plan
+            or existing.environment != environment
+        ):
+            raise MemoryStoreError("attempt identifier was reused with different inputs")
+
+    @staticmethod
+    def _validate_existing_trace_identity(
+        connection: sqlite3.Connection,
+        attempt: AttemptRecord,
+    ) -> None:
+        rows = connection.execute(
+            "SELECT document FROM trace_events WHERE attempt_id = ? ORDER BY sequence",
+            (str(attempt.attempt_id),),
+        ).fetchall()
+        for row in rows:
+            event = TraceEvent.model_validate_json(row[0])
+            if event.trace_id != attempt.trace_id or event.task_id != attempt.task.task_id:
+                raise MemoryStoreError("attempt trace belongs to another task or trace")
+
     @staticmethod
     def _require_identical(existing: str, candidate: str, kind: str) -> None:
-        if json.loads(existing) != json.loads(candidate):
+        if canonical_json(json.loads(existing)) != canonical_json(json.loads(candidate)):
             raise MemoryStoreError(f"immutable {kind} identifier was reused with new content")
 
     @contextmanager
@@ -426,6 +834,20 @@ class SQLiteMemoryStore:
                     contradiction_id TEXT PRIMARY KEY,
                     document TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS environments (
+                    fingerprint TEXT PRIMARY KEY,
+                    document TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS attempts (
+                    attempt_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    document TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS recording_receipts (
+                    attempt_id TEXT PRIMARY KEY REFERENCES attempts(attempt_id),
+                    transaction_id TEXT NOT NULL UNIQUE,
+                    document TEXT NOT NULL
+                );
                 """
             )
             row = connection.execute(
@@ -436,5 +858,55 @@ class SQLiteMemoryStore:
                     "INSERT INTO schema_metadata(singleton, version) VALUES (1, ?)",
                     (_SCHEMA_VERSION,),
                 )
+            elif row[0] in {2, 3}:
+                self._migrate_documents_to_v4(connection)
+                connection.execute(
+                    "UPDATE schema_metadata SET version = ? WHERE singleton = 1",
+                    (_SCHEMA_VERSION,),
+                )
             elif row[0] != _SCHEMA_VERSION:
                 raise MemoryStoreError(f"unsupported memory schema version: {row[0]}")
+
+    @staticmethod
+    def _migrate_documents_to_v4(connection: sqlite3.Connection) -> None:
+        document_models = {
+            "trace_events": TraceEvent,
+            "evidence": Evidence,
+            "cost_entries": CostEntry,
+            "episodes": Episode,
+            "episode_transitions": EpisodeTransition,
+            "artifact_relations": ArtifactRelation,
+            "contradictions": ContradictionRecord,
+            "environments": EnvironmentRecord,
+            "attempts": AttemptRecord,
+        }
+        for table, model in document_models.items():
+            rows = connection.execute(f"SELECT rowid, document FROM {table}").fetchall()
+            for rowid, document in rows:
+                canonical_document = canonical_json(model.model_validate_json(document))
+                connection.execute(
+                    f"UPDATE {table} SET document = ? WHERE rowid = ?",
+                    (canonical_document, rowid),
+                )
+
+        rows = connection.execute("SELECT attempt_id, status, document FROM attempts").fetchall()
+        for attempt_id, status, document in rows:
+            attempt = AttemptRecord.model_validate_json(document)
+            if status != AttemptStatus.FINALIZED.value:
+                continue
+            transaction_id = uuid5(
+                NAMESPACE_URL,
+                f"https://llmin.local/migration/v4/attempt/{attempt_id}",
+            )
+            receipt = RecordingReceipt(
+                attempt_id=attempt.attempt_id,
+                trace_id=attempt.trace_id,
+                task_id=attempt.task.task_id,
+                document_hash=canonical_sha256(attempt),
+                storage_transaction_id=transaction_id,
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO recording_receipts"
+                "(attempt_id, transaction_id, document) VALUES (?, ?, ?)",
+                (attempt_id, str(transaction_id), canonical_json(receipt)),
+            )

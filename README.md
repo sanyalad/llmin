@@ -8,6 +8,10 @@ LLMIN — экспериментальная автономная агентна
 
 ## Основные документы
 
+- [Architect Handbook](docs/architecture.md): [компоненты](docs/components.md),
+  [понятия](docs/concepts.md), [глоссарий](docs/glossary.md),
+  [решения](docs/decisions.md), [roadmap](docs/roadmap.md),
+  [эксперименты](docs/experiments.md)
 - [Манифест](docs/manifesto.md)
 - [Подробный план первого этапа](docs/stage-1-plan.md)
 - [ADR-0001: первый вертикальный срез](docs/adr/0001-terminal-vertical-slice.md)
@@ -17,6 +21,7 @@ LLMIN — экспериментальная автономная агентна
 - [Независимая верификация](docs/verification.md)
 - [Stage 1 benchmark](docs/benchmark.md)
 - [Memory v0](docs/memory.md)
+- [План улучшений после ревью Memory v0](docs/improvement-plan.md)
 - [Как участвовать в разработке](CONTRIBUTING.md)
 
 ## Коротко об архитектуре
@@ -63,6 +68,13 @@ llmin validate-task benchmarks\tasks\config_patch\001.json
 
 ```powershell
 llmin run-fixture <task.json> <plan.json> <base-root>
+```
+
+Команда возвращает `attempt_id` и `trace_id`. Сохранённый статус, диагностические события и
+evidence можно повторно получить из SQLite, в том числе из нового процесса:
+
+```powershell
+llmin show-attempt <base-root>\.llmin\memory.sqlite3 <attempt-id>
 ```
 
 Состояние `COMPLETED` возможно только после verifier verdict `PASSED`.

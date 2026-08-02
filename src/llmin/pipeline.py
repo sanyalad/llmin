@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from uuid import UUID
 
-from llmin.domain import TaskSpec, VerificationReport, VerificationVerdict
+from llmin.domain import ExecutionPlan, TaskSpec, VerificationReport, VerificationVerdict
 from llmin.execution import ExecutionReport, Executor
 from llmin.observability.trace import TraceEvent, TraceSink
 from llmin.orchestrator import OrchestratorRun, TaskState
@@ -14,7 +15,11 @@ from llmin.verification import VerificationService
 
 @dataclass(frozen=True)
 class PipelineResult:
+    task_id: UUID
+    trace_id: UUID
+    attempt_id: UUID
     final_state: TaskState
+    execution_plan: ExecutionPlan | None
     execution_report: ExecutionReport | None
     verification_report: VerificationReport | None
 
@@ -33,8 +38,25 @@ class Pipeline:
         self._verification = verification
         self._trace_sink = trace_sink
 
-    def run(self, task: TaskSpec) -> PipelineResult:
-        run = OrchestratorRun(task_id=task.task_id, trace_sink=self._trace_sink)
+    def run(
+        self,
+        task: TaskSpec,
+        *,
+        trace_id: UUID | None = None,
+        attempt_id: UUID | None = None,
+    ) -> PipelineResult:
+        """Execute and verify a task.
+
+        Durable terminal transitions are owned by AttemptCoordinator and the memory store.
+        A successful standalone pipeline run therefore stops at VERIFIED.
+        """
+
+        run = OrchestratorRun(
+            task_id=task.task_id,
+            trace_sink=self._trace_sink,
+            trace_id=trace_id,
+            attempt_id=attempt_id,
+        )
         run.transition(TaskState.ROUTED, reason="task accepted for routing")
         try:
             plan = self._planner.plan(task)
@@ -49,13 +71,26 @@ class Pipeline:
                 )
             )
             run.transition(TaskState.FAILED, reason="planner failed")
-            return PipelineResult(run.state, None, None)
+            return PipelineResult(
+                task.task_id, run.trace_id, run.attempt_id, run.state, None, None, None
+            )
 
         run.transition(TaskState.PLANNED, reason="planner produced a structured plan")
         authorization_error = self._executor.authorize(task=task, plan=plan)
         if authorization_error is not None:
+            self._trace_sink.emit(
+                TraceEvent(
+                    trace_id=run.trace_id,
+                    task_id=task.task_id,
+                    attempt_id=run.attempt_id,
+                    event_type="authorization.failed",
+                    payload={"reason": authorization_error},
+                )
+            )
             run.transition(TaskState.FAILED, reason="plan authorization failed")
-            return PipelineResult(run.state, None, None)
+            return PipelineResult(
+                task.task_id, run.trace_id, run.attempt_id, run.state, plan, None, None
+            )
         run.transition(TaskState.AUTHORIZED, reason="plan passed capability policy")
 
         try:
@@ -67,10 +102,14 @@ class Pipeline:
             )
         except Exception:
             run.transition(TaskState.FAILED, reason="executor failed unexpectedly")
-            return PipelineResult(run.state, None, None)
+            return PipelineResult(
+                task.task_id, run.trace_id, run.attempt_id, run.state, plan, None, None
+            )
         if not execution.success:
             run.transition(TaskState.FAILED, reason="execution failed")
-            return PipelineResult(run.state, execution, None)
+            return PipelineResult(
+                task.task_id, run.trace_id, run.attempt_id, run.state, plan, execution, None
+            )
         run.transition(TaskState.EXECUTED, reason="all actions returned successfully")
 
         try:
@@ -81,12 +120,28 @@ class Pipeline:
             )
         except Exception:
             run.transition(TaskState.FAILED, reason="verifier failed unexpectedly")
-            return PipelineResult(run.state, execution, None)
+            return PipelineResult(
+                task.task_id, run.trace_id, run.attempt_id, run.state, plan, execution, None
+            )
         if verification.verdict is not VerificationVerdict.PASSED:
             run.transition(TaskState.FAILED, reason="independent verification did not pass")
-            return PipelineResult(run.state, execution, verification)
+            return PipelineResult(
+                task.task_id,
+                run.trace_id,
+                run.attempt_id,
+                run.state,
+                plan,
+                execution,
+                verification,
+            )
 
         run.transition(TaskState.VERIFIED, reason="independent verifier passed")
-        run.transition(TaskState.RECORDED, reason="trace and evidence emitted")
-        run.transition(TaskState.COMPLETED, reason="task reached a verified terminal state")
-        return PipelineResult(run.state, execution, verification)
+        return PipelineResult(
+            task.task_id,
+            run.trace_id,
+            run.attempt_id,
+            run.state,
+            plan,
+            execution,
+            verification,
+        )
